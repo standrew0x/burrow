@@ -17,6 +17,22 @@ dist-ssr/
 .vite/
 *.tsbuildinfo
 
+# Vite writes *.local for machine-local overrides
+*.local
+
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# MSBuild / VS project litter, in case the MSVC tooling drops any
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
 # ---------------------------------------------------------------------------
 # ONNX model weights — NEVER COMMIT THESE
 # ---------------------------------------------------------------------------
