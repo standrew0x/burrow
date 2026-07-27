@@ -36,7 +36,7 @@ models/
 # ---------------------------------------------------------------------------
 # The app hoards images for a living. One careless `git add -A` over a dev
 # library and those blobs are in history permanently. Real libraries live in
-# %LOCALAPPDATA%\gatherwin — same path shipping builds use. Keep it that way.
+# %LOCALAPPDATA%\burrow — same path shipping builds use. Keep it that way.
 dev-library/
 library/
 blobs/

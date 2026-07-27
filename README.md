@@ -1,35 +1,46 @@
-# GatherWin
+# Burrow
 
 A local-first visual reference manager for Windows. Capture, organize, and
 search design references without leaving the desktop.
-
-Status: **repo scaffold only.** No application code yet.
 
 ---
 
 ## Prerequisites
 
-| Tool | Status on this machine | Install |
-| --- | --- | --- |
-| git | installed (2.54.0) | — |
-| Node | installed (v24.15.0) | — |
-| Rust / cargo | **missing** | https://rustup.rs |
-| MSVC Build Tools | **check** | Visual Studio Installer → "Desktop development with C++" |
-| WebView2 runtime | ships with Windows 11 | — |
-| GitHub CLI (`gh`) | **missing**, optional | https://cli.github.com |
+| Tool | Install |
+| --- | --- |
+| git | — |
+| Node 22+ | — |
+| Rust / cargo | `winget install Rustlang.Rustup` |
+| MSVC Build Tools + Windows SDK | `winget install Microsoft.VisualStudio.2022.BuildTools` with the VCTools workload |
+| WebView2 runtime | ships with Windows 11 |
+| GitHub CLI (`gh`), optional | `winget install GitHub.cli` |
 
-Rust on Windows needs the MSVC linker; `rustup` will prompt for it if the
-Build Tools are absent.
+Rust's `x86_64-pc-windows-msvc` target cannot link without the MSVC toolchain
+and Windows SDK. The `x86_64-pc-windows-gnu` toolchain is **not** a workaround
+here — Tauri's WebView2 and `windows-rs` dependencies expect MSVC.
 
 ## Scaffolding the app
 
-Once Rust is installed, generate the Tauri v2 app **into this existing repo**:
+Already done, but for reference — `create-tauri-app` takes `--force` to write
+into a non-empty directory, which is how it was layered on top of this repo:
 
 ```bash
-npm create tauri-app@latest -- --manifest-path . --template react-ts --identifier co.gatherwin.app
+npm create tauri-app@latest burrow -- --force -m npm -t react-ts --identifier co.burrow.app --tauri-version 2 -y
 ```
 
-Then confirm the ignore rules are doing their job before the first code commit:
+Run from the *parent* directory, with `burrow` as the project name. There is no
+`--manifest-path` flag. Because `--force` will overwrite a root `.gitignore` and
+`README.md` from its own template, commit before running it and diff after.
+
+## Development
+
+```bash
+npm install
+npm run tauri dev
+```
+
+Confirm the ignore rules hold before any commit:
 
 ```bash
 git status --short
@@ -51,7 +62,7 @@ free tier is 1 GiB storage and 1 GiB/month bandwidth, which a few CI runs
 exhaust.
 
 **Dev libraries live outside the repo.** This app's whole job is accumulating
-images. Point dev builds at `%LOCALAPPDATA%\gatherwin` — the same path shipping
+images. Point dev builds at `%LOCALAPPDATA%\burrow` — the same path shipping
 builds use. `fixtures/`, `dev-library/`, and `blobs/` are ignored as a
 backstop, but the habit matters more than the safety net.
 

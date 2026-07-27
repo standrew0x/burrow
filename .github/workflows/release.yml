@@ -120,7 +120,7 @@ jobs:
           # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         with:
           tagName: ${{ github.ref_name }}
-          releaseName: 'GatherWin ${{ github.ref_name }}'
+          releaseName: 'Burrow ${{ github.ref_name }}'
           releaseBody: 'See the assets below to download and install.'
           # Publish as a draft so you can smoke-test the installer before
           # anyone's auto-updater sees it. Flip to false once you trust it.
