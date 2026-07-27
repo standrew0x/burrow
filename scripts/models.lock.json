@@ -1,0 +1,27 @@
+{
+  "$comment": [
+    "Pinned ONNX weights. These files are NEVER committed to git -- see .gitignore.",
+    "Publish each blob once as an asset on a GitHub Release (a dedicated",
+    "'models-v1' tag works well), then record its URL and SHA-256 here.",
+    "The sha256 fields below are placeholders; fill them in with the real",
+    "digest via: (Get-FileHash .\\models\\<file> -Algorithm SHA256).Hash.ToLower()"
+  ],
+  "models": [
+    {
+      "name": "siglip-base-patch16-224-vision",
+      "file": "vision_encoder.onnx",
+      "url": "https://github.com/OWNER/gatherwin/releases/download/models-v1/vision_encoder.onnx",
+      "sha256": "REPLACE_ME",
+      "sizeBytes": 0,
+      "purpose": "Image -> embedding. Powers visual similarity search and zero-shot auto-tagging."
+    },
+    {
+      "name": "siglip-base-patch16-224-text",
+      "file": "text_encoder.onnx",
+      "url": "https://github.com/OWNER/gatherwin/releases/download/models-v1/text_encoder.onnx",
+      "sha256": "REPLACE_ME",
+      "sizeBytes": 0,
+      "purpose": "Text -> embedding, same space as the vision encoder. Powers text-to-image search."
+    }
+  ]
+}

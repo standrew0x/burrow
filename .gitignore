@@ -1,0 +1,105 @@
+# ---------------------------------------------------------------------------
+# Rust / Tauri
+# ---------------------------------------------------------------------------
+target/
+**/*.rs.bk
+*.pdb
+
+# NOTE: Cargo.lock IS committed. This is a shipping application, not a library.
+# Committing it is what makes a CI build reproducible. Do not add it here.
+
+# ---------------------------------------------------------------------------
+# Node / frontend
+# ---------------------------------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+*.tsbuildinfo
+
+# ---------------------------------------------------------------------------
+# ONNX model weights — NEVER COMMIT THESE
+# ---------------------------------------------------------------------------
+# 100-350MB per model, and git keeps every revision forever. Fetched at build
+# time by scripts/fetch-models.ps1 from a GitHub Release asset, verified by
+# SHA-256. Git LFS is not an escape hatch: the free tier is 1 GiB storage and
+# 1 GiB/month bandwidth, which a handful of CI runs will exhaust.
+models/
+*.onnx
+*.onnx_data
+*.safetensors
+*.gguf
+*.bin
+
+# ---------------------------------------------------------------------------
+# Local dev library / user data
+# ---------------------------------------------------------------------------
+# The app hoards images for a living. One careless `git add -A` over a dev
+# library and those blobs are in history permanently. Real libraries live in
+# %LOCALAPPDATA%\gatherwin — same path shipping builds use. Keep it that way.
+dev-library/
+library/
+blobs/
+thumbnails/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# Sample/reference imagery used while developing
+fixtures/
+scratch/
+
+# ---------------------------------------------------------------------------
+# Secrets and signing material
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.pem
+*.key
+*.cer
+*.crt
+# Tauri updater private key — if this leaks, anyone can push a signed update
+# to every install. It belongs in a GitHub secret, never on disk in the repo.
+*.key.pub.local
+tauri-updater.key
+
+# ---------------------------------------------------------------------------
+# Build output
+# ---------------------------------------------------------------------------
+release/
+out/
+*.msi
+*.msix
+*.exe
+*.nsis.zip
+*.msi.zip
+*.sig
+
+# ---------------------------------------------------------------------------
+# Windows shell litter
+# ---------------------------------------------------------------------------
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# ---------------------------------------------------------------------------
+# Editors
+# ---------------------------------------------------------------------------
+.vs/
+.idea/
+*.swp
+*~
+.DS_Store
+
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+!.vscode/launch.json

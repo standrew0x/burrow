@@ -1,0 +1,142 @@
+name: Release
+
+# Tagged releases only, plus manual dispatch.
+#
+# Deliberately NOT `on: push` to any branch. Free-tier private repos get 2,000
+# CI minutes/month and Windows runners bill at a 2x multiplier -- so ~1,000 real
+# Windows minutes. A cold Rust/Tauri build is 10-20 of them. Day-to-day checks
+# run locally via .githooks/pre-push instead.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build but do not publish a release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write   # required to create the Release and upload artifacts
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast in CI rather than shipping a binary full of warnings
+  RUSTFLAGS: -D warnings
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Cuts warm builds from ~15min to ~4min. Keyed on Cargo.lock, which is
+      # why Cargo.lock is committed.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      # ONNX weights are not in the repo. Pull them from a Release asset and
+      # verify the hash before they get bundled into the installer.
+      - name: Cache model weights
+        id: model-cache
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-${{ hashFiles('scripts/models.lock.json') }}
+
+      - name: Fetch model weights
+        if: steps.model-cache.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: ./scripts/fetch-models.ps1
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      # -----------------------------------------------------------------
+      # CODE SIGNING -- STUBBED, NOT YET ACTIVE
+      # -----------------------------------------------------------------
+      # Unsigned Windows binaries hit a SmartScreen "unrecognized app" wall
+      # that kills install conversion. Since 2023, OV certs require an HSM,
+      # so the practical options are Azure Trusted Signing (~$10/mo) or a
+      # token-based cert (~$250-400/yr).
+      #
+      # TO ACTIVATE:
+      #  1. Set up Azure Trusted Signing; note your endpoint, account name,
+      #     and certificate profile name.
+      #  2. Create a service principal, and add these repo secrets:
+      #       AZURE_TENANT_ID, AZURE_CLIENT_ID, AZURE_CLIENT_SECRET
+      #       TRUSTED_SIGNING_ENDPOINT, TRUSTED_SIGNING_ACCOUNT,
+      #       TRUSTED_SIGNING_PROFILE
+      #  3. Uncomment the two steps below.
+      #  4. In src-tauri/tauri.conf.json set:
+      #       "bundle": { "windows": { "signCommand": "trusted-signing-cli -e %{endpoint} -a %{account} -c %{profile} %1" } }
+      #
+      # Why signCommand rather than signing artifacts afterwards: Tauri has to
+      # sign the .exe BEFORE it is embedded in the NSIS/MSI installer, then
+      # sign the installer, then generate the updater signature over the final
+      # bytes. Post-hoc signing breaks that ordering and invalidates the
+      # updater manifest.
+      #
+      # - name: Install trusted-signing-cli
+      #   run: cargo install trusted-signing-cli
+      #
+      # - name: Azure login
+      #   uses: azure/login@v2
+      #   with:
+      #     creds: |
+      #       {
+      #         "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+      #         "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+      #         "tenantId": "${{ secrets.AZURE_TENANT_ID }}",
+      #         "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}"
+      #       }
+
+      - name: Build and publish
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing keys. Generate once with:
+          #   npm run tauri signer generate -- -w tauri-updater.key
+          # Put the PRIVATE key in the TAURI_SIGNING_PRIVATE_KEY secret and the
+          # PUBLIC key in tauri.conf.json under plugins.updater.pubkey.
+          # If the private key leaks, anyone can push a signed update to every
+          # install. It never touches disk in this repo.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          # Uncomment alongside the signing steps above:
+          # AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          # AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'GatherWin ${{ github.ref_name }}'
+          releaseBody: 'See the assets below to download and install.'
+          # Publish as a draft so you can smoke-test the installer before
+          # anyone's auto-updater sees it. Flip to false once you trust it.
+          releaseDraft: true
+          prerelease: false
+          includeUpdaterJson: true
+          args: --target x86_64-pc-windows-msvc
+
+      # Always keep the raw bundles, even on a dry run where no Release exists.
+      - name: Upload build artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-bundles
+          path: |
+            src-tauri/target/release/bundle/nsis/*
+            src-tauri/target/release/bundle/msi/*
+          retention-days: 14
+          if-no-files-found: warn

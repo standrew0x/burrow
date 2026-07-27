@@ -1,0 +1,27 @@
+#!/bin/sh
+# Local gate so CI minutes stay reserved for release builds.
+# Enabled via: git config core.hooksPath .githooks
+#
+# Skip once with: git push --no-verify
+
+set -e
+
+if [ ! -d src-tauri ]; then
+    echo "pre-push: src-tauri/ not present yet, skipping Rust checks."
+    exit 0
+fi
+
+echo "pre-push: cargo fmt --check"
+( cd src-tauri && cargo fmt --check ) || {
+    echo ""
+    echo "pre-push: formatting issues. Fix with: cargo fmt --manifest-path src-tauri/Cargo.toml"
+    exit 1
+}
+
+echo "pre-push: cargo clippy"
+( cd src-tauri && cargo clippy --all-targets -- -D warnings )
+
+echo "pre-push: cargo test"
+( cd src-tauri && cargo test )
+
+echo "pre-push: ok"
