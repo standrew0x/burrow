@@ -34,6 +34,7 @@ const PALETTE_SIZE: usize = 5;
 const DECODE_CHUNK: usize = 16;
 
 #[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct AssetRow {
     pub id: i64,
     pub hash: String,
@@ -46,6 +47,9 @@ pub struct AssetRow {
     pub source_url: Option<String>,
     pub imported_at: i64,
     pub swatches: Vec<Swatch>,
+    /// Absolute path to the thumbnail, included on every row so the grid does
+    /// not need one IPC round-trip per tile to render.
+    pub thumb_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -198,6 +202,7 @@ pub fn import_paths(
             source_url: None,
             imported_at,
             swatches: p.swatches.clone(),
+            thumb_path: lib.thumb_path(&p.hash).display().to_string(),
         });
     }
     tx.commit()?;
@@ -238,16 +243,23 @@ fn prepare_one(lib: &Library, path: &Path, hash: &str) -> Result<Prepared> {
 }
 
 /// Most recently imported first.
-pub fn list_assets(conn: &Connection, limit: i64, offset: i64) -> Result<Vec<AssetRow>> {
+pub fn list_assets(
+    lib: &Library,
+    conn: &Connection,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<AssetRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, hash, ext, mime, width, height, bytes, original_name, source_url, imported_at
          FROM assets ORDER BY imported_at DESC, id DESC LIMIT ?1 OFFSET ?2",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![limit, offset], |r| {
+            let hash: String = r.get(1)?;
             Ok(AssetRow {
                 id: r.get(0)?,
-                hash: r.get(1)?,
+                thumb_path: lib.thumb_path(&hash).display().to_string(),
+                hash,
                 ext: r.get(2)?,
                 mime: r.get(3)?,
                 width: r.get(4)?,
@@ -299,6 +311,7 @@ pub struct ColorMatch {
 /// exact distance is computed in Rust. Doing the whole thing in SQL would need
 /// a sqrt over three columns per row, which SQLite cannot index anyway.
 pub fn search_by_color(
+    lib: &Library,
     conn: &Connection,
     hex: &str,
     tolerance: f32,
@@ -355,14 +368,14 @@ pub fn search_by_color(
 
     let mut out = Vec::with_capacity(ranked.len());
     for (asset_id, distance) in ranked {
-        if let Some(asset) = asset_by_id(conn, asset_id)? {
+        if let Some(asset) = asset_by_id(lib, conn, asset_id)? {
             out.push(ColorMatch { asset, distance });
         }
     }
     Ok(out)
 }
 
-fn asset_by_id(conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
+fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, hash, ext, mime, width, height, bytes, original_name, source_url, imported_at
          FROM assets WHERE id = ?1",
@@ -371,9 +384,11 @@ fn asset_by_id(conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
     let Some(r) = rows.next()? else {
         return Ok(None);
     };
+    let hash: String = r.get(1)?;
     let mut asset = AssetRow {
         id: r.get(0)?,
-        hash: r.get(1)?,
+        thumb_path: lib.thumb_path(&hash).display().to_string(),
+        hash,
         ext: r.get(2)?,
         mime: r.get(3)?,
         width: r.get(4)?,
@@ -531,13 +546,13 @@ mod tests {
         let b = fx.write_png("two.png", 8, 8, [0, 255, 0, 255]);
         import_paths(&fx.lib, &mut fx.conn, &[a, b]).expect("import");
 
-        let listed = list_assets(&fx.conn, 10, 0).expect("list");
+        let listed = list_assets(&fx.lib, &fx.conn, 10, 0).expect("list");
         assert_eq!(listed.len(), 2);
         // Same imported_at within one batch, so id DESC breaks the tie.
         assert!(listed[0].id > listed[1].id);
         assert!(listed.iter().all(|a| !a.swatches.is_empty()));
 
-        let page = list_assets(&fx.conn, 1, 1).expect("page");
+        let page = list_assets(&fx.lib, &fx.conn, 1, 1).expect("page");
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].id, listed[1].id);
     }
@@ -550,16 +565,16 @@ mod tests {
         import_paths(&fx.lib, &mut fx.conn, &[red, green]).expect("import");
 
         // A slightly-off red should match the red image.
-        let hits = search_by_color(&fx.conn, "#f50505", 0.15, 10).expect("search");
+        let hits = search_by_color(&fx.lib, &fx.conn, "#f50505", 0.15, 10).expect("search");
         assert_eq!(hits.len(), 1, "{hits:?}");
         assert_eq!(hits[0].asset.original_name.as_deref(), Some("red.png"));
 
         // A tolerance of zero matches nothing but an exact hit.
-        let none = search_by_color(&fx.conn, "#f50505", 0.0, 10).expect("search");
+        let none = search_by_color(&fx.lib, &fx.conn, "#f50505", 0.0, 10).expect("search");
         assert!(none.is_empty());
 
         // Exact green matches green.
-        let green_hits = search_by_color(&fx.conn, "#00ff00", 0.05, 10).expect("search");
+        let green_hits = search_by_color(&fx.lib, &fx.conn, "#00ff00", 0.05, 10).expect("search");
         assert_eq!(green_hits.len(), 1);
         assert_eq!(
             green_hits[0].asset.original_name.as_deref(),
@@ -573,7 +588,7 @@ mod tests {
         let red = fx.write_png("red.png", 8, 8, [255, 0, 0, 255]);
         import_paths(&fx.lib, &mut fx.conn, &[red]).expect("import");
 
-        assert!(search_by_color(&fx.conn, "not-a-colour", 1.0, 10)
+        assert!(search_by_color(&fx.lib, &fx.conn, "not-a-colour", 1.0, 10)
             .expect("search")
             .is_empty());
     }
@@ -597,7 +612,7 @@ mod tests {
 
         import_paths(&fx.lib, &mut fx.conn, &[path]).expect("import");
 
-        let hits = search_by_color(&fx.conn, "#ff0000", 0.5, 10).expect("search");
+        let hits = search_by_color(&fx.lib, &fx.conn, "#ff0000", 0.5, 10).expect("search");
         assert_eq!(hits.len(), 1, "one asset must not rank twice: {hits:?}");
     }
 }

@@ -9,9 +9,15 @@ use crate::error::{Error, Result};
 use crate::ingest::{self, AssetRow, ColorMatch, ImportReport};
 use crate::store::Library;
 
-/// Default OkLab radius for colour search. OkLab L spans 0..1, so 0.12 is a
-/// "same colour family" band rather than "same exact shade".
-const DEFAULT_COLOR_TOLERANCE: f32 = 0.12;
+/// Default OkLab radius for colour search.
+///
+/// Tuned against a 24-image library of architectural photos, which is close to
+/// a worst case: everything shares sky and glass, so the palettes overlap
+/// heavily. Match counts at each radius were 5 / 10 / 19 / 22 for 0.03 / 0.05 /
+/// 0.08 / 0.12. Past ~0.08 the filter hands back most of the library and stops
+/// being a filter. 0.05 errs tight on purpose -- too few results is a visible,
+/// recoverable state (widen the search), while too many just looks broken.
+const DEFAULT_COLOR_TOLERANCE: f32 = 0.05;
 const DEFAULT_PAGE_SIZE: i64 = 200;
 
 pub struct AppState {
@@ -48,6 +54,7 @@ pub fn list_assets(
 ) -> Result<Vec<AssetRow>> {
     let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
     ingest::list_assets(
+        &state.library,
         &conn,
         limit.unwrap_or(DEFAULT_PAGE_SIZE),
         offset.unwrap_or(0),
@@ -63,19 +70,12 @@ pub fn search_by_color(
 ) -> Result<Vec<ColorMatch>> {
     let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
     ingest::search_by_color(
+        &state.library,
         &conn,
         &hex,
         tolerance.unwrap_or(DEFAULT_COLOR_TOLERANCE),
         limit.unwrap_or(DEFAULT_PAGE_SIZE as usize),
     )
-}
-
-/// Absolute path to the thumbnail for `hash`. The frontend turns this into a
-/// loadable URL with `convertFileSrc`, which needs the asset protocol enabled
-/// and this directory in its scope.
-#[tauri::command]
-pub fn thumb_path(state: tauri::State<'_, AppState>, hash: String) -> String {
-    state.library.thumb_path(&hash).display().to_string()
 }
 
 #[tauri::command]

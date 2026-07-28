@@ -22,7 +22,6 @@ pub fn run() {
             commands::import_paths,
             commands::list_assets,
             commands::search_by_color,
-            commands::thumb_path,
             commands::library_root,
         ])
         .run(tauri::generate_context!())
