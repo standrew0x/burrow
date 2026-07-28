@@ -108,9 +108,54 @@ publishing is what exposes the new version to every user's auto-updater.
 ## Layout
 
 ```
+src-tauri/src/store.rs          content-addressed blob store
+src-tauri/src/db.rs             schema + user_version migrations
+src-tauri/src/image_ops.rs      decode, thumbnail, palette sampling
+src-tauri/src/color.rs          OkLab conversion + k-means palette
+src-tauri/src/ingest.rs         four-phase import, list, colour search
+src-tauri/src/commands.rs       Tauri command surface
+src-tauri/examples/ingest.rs    dev tool: import without the UI
 .github/workflows/release.yml   tag-triggered build, sign, publish
 .github/workflows/ci.yml        fmt + clippy + test on PRs
 .githooks/pre-push              local gate, saves CI minutes
 scripts/models.lock.json        pinned ONNX weights (url + sha256)
 scripts/fetch-models.ps1        hash-verified downloader
+```
+
+## Ingest pipeline
+
+Import runs in four phases so the expensive work parallelises while SQLite
+writes stay serial:
+
+1. hash every candidate in parallel — read + blake3
+2. one query drops digests already held, and digests repeated within the batch
+3. decode / thumbnail / palette the survivors in parallel, writing blobs
+4. one transaction inserts the rows
+
+Phase 3 re-reads each file rather than carrying phase 1's bytes forward. A drop
+of 500 photos is several GB; holding all of it to save a re-read the page cache
+will serve is the wrong trade. Phase 3 is chunked at 16 files because a decoded
+48MP image is ~190MB as RGBA8 and an unbounded fan-out can exhaust RAM.
+
+Blobs are written *before* the DB row. A crash between the two leaves an
+orphaned blob — wasted disk, reclaimable by a GC pass — rather than a row
+pointing at a file that was never written, which would render as a permanently
+broken tile.
+
+Measured on 161 real photos (up to 70MP, 1.4GB total): 44s cold, 0.9s to
+re-scan as duplicates, 6MB of thumbnails.
+
+### Why OkLab
+
+Clustering happens in OkLab, not sRGB. sRGB distance does not track perceived
+difference — two greens a fixed distance apart look far closer than two blues
+the same distance apart — so k-means in sRGB produces clusters that disagree
+with what a designer would call "the same colour". k-means seeding is a
+deterministic xorshift so a re-index cannot silently change stored swatches and
+invalidate saved colour searches.
+
+### Trying it
+
+```bash
+cargo run --release --example ingest -- C:\Temp\burrow-lib C:\some\image\folder
 ```

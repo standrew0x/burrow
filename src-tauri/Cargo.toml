@@ -22,4 +22,11 @@ tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+blake3 = "1.8.5"
+image = "0.25.10"
+rayon = "1.12.0"
+thiserror = "2.0.19"
+dirs = "6.0.0"
+webp = "0.3.1"
 
