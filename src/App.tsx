@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 
-import { importPaths, libraryRoot, listAssets, searchByColor, thumbUrl } from "./api";
+import { openPath } from "@tauri-apps/plugin-opener";
+
+import {
+  blobUrl,
+  importPaths,
+  isPlayableInline,
+  libraryRoot,
+  listAssets,
+  searchByColor,
+  thumbUrl,
+} from "./api";
 import type { Asset, FailedImport } from "./types";
 import "./App.css";
 
@@ -24,6 +34,15 @@ function formatBytes(n: number): string {
 /** Readable ink over a swatch, chosen from OkLab lightness. */
 const swatchInk = (l: number) => (l > 0.62 ? "#111" : "#fff");
 
+function formatDuration(ms: number): string {
+  const total = Math.round(ms / 1000);
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
 export default function App() {
   const [assets, setAssets] = useState<Asset[]>([]);
   const [loading, setLoading] = useState(true);
@@ -34,6 +53,10 @@ export default function App() {
   const [colorFilter, setColorFilter] = useState<string | null>(null);
   const [hexInput, setHexInput] = useState("");
   const [root, setRoot] = useState("");
+  const [playing, setPlaying] = useState<Asset | null>(null);
+  /** Set when the <video> element refuses the file despite a playable container
+   *  — an HEVC or AV1 mp4, typically. */
+  const [playbackFailed, setPlaybackFailed] = useState(false);
 
   const refresh = useCallback(async () => {
     try {
@@ -224,13 +247,32 @@ export default function App() {
         <main className="grid">
           {assets.map((asset) => (
             <figure className="tile" key={asset.id}>
-              <img
-                src={thumbUrl(asset)}
-                alt={asset.originalName ?? asset.hash}
-                loading="lazy"
-                width={asset.width}
-                height={asset.height}
-              />
+              <div className="tile__media">
+                <img
+                  src={thumbUrl(asset)}
+                  alt={asset.originalName ?? asset.hash}
+                  loading="lazy"
+                  width={asset.width}
+                  height={asset.height}
+                />
+                {asset.kind === "video" && (
+                  <button
+                    type="button"
+                    className="tile__play"
+                    onClick={() => setPlaying(asset)}
+                    aria-label={`Play ${asset.originalName ?? "video"}`}
+                  >
+                    <span className="tile__playIcon" aria-hidden="true">
+                      ▶
+                    </span>
+                    {asset.durationMs !== null && (
+                      <span className="tile__duration">
+                        {formatDuration(asset.durationMs)}
+                      </span>
+                    )}
+                  </button>
+                )}
+              </div>
               <figcaption className="tile__meta">
                 <span className="tile__name">
                   {asset.originalName ?? asset.hash.slice(0, 12)}
@@ -264,6 +306,57 @@ export default function App() {
       {dragging && (
         <div className="dropzone">
           <p>Release to import</p>
+        </div>
+      )}
+
+      {playing && (
+        <div
+          className="player"
+          role="dialog"
+          aria-modal="true"
+          aria-label={playing.originalName ?? "Video"}
+          onClick={() => {
+            setPlaying(null);
+            setPlaybackFailed(false);
+          }}
+        >
+          {/* Stop propagation so clicking the video itself does not dismiss. */}
+          <div className="player__frame" onClick={(e) => e.stopPropagation()}>
+            {isPlayableInline(playing) && !playbackFailed ? (
+              <video
+                src={blobUrl(playing)}
+                controls
+                autoPlay
+                onError={() => setPlaybackFailed(true)}
+              />
+            ) : (
+              <div className="player__fallback">
+                <p>
+                  This one won't play in the app
+                  {playbackFailed ? " — the codec isn't supported here." : "."}
+                </p>
+                <p className="player__fallbackDetail">
+                  {playing.mime} · {playing.ext.toUpperCase()}
+                </p>
+                <button type="button" onClick={() => void openPath(playing.blobPath)}>
+                  Open in default player
+                </button>
+              </div>
+            )}
+            <div className="player__meta">
+              <span>{playing.originalName ?? playing.hash.slice(0, 12)}</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setPlaying(null);
+                  setPlaybackFailed(false);
+                }}
+                aria-label="Close"
+              >
+                ×
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

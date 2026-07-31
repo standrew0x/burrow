@@ -12,9 +12,14 @@ export interface Swatch {
   weight: number;
 }
 
+export type MediaKind = "image" | "video";
+
 export interface Asset {
   id: number;
   hash: string;
+  kind: MediaKind;
+  /** Milliseconds; null for images. */
+  durationMs: number | null;
   ext: string;
   mime: string;
   width: number;
@@ -26,6 +31,8 @@ export interface Asset {
   swatches: Swatch[];
   /** Absolute path; run through convertFileSrc before use in an <img>. */
   thumbPath: string;
+  /** Absolute path to the stored original, for video playback. */
+  blobPath: string;
 }
 
 export interface FailedImport {

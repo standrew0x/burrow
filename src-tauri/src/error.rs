@@ -25,6 +25,9 @@ pub enum Error {
     #[error("unsupported file type: {0}")]
     Unsupported(PathBuf),
 
+    #[error("{0}")]
+    Ffmpeg(String),
+
     #[error("no library directory available on this platform")]
     NoLibraryDir,
 

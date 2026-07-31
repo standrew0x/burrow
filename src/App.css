@@ -232,6 +232,52 @@ button:focus-visible {
   background: var(--surface-2);
 }
 
+.tile__media {
+  position: relative;
+  display: block;
+}
+
+/* Covers the whole thumbnail so anywhere on a video tile starts playback,
+   rather than asking for a click on a small target. */
+.tile__play {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: flex-end;
+  justify-content: flex-start;
+  gap: 6px;
+  padding: 8px;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+.tile__playIcon {
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  padding-left: 2px;
+  font-size: 11px;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 50%;
+  transition: background 120ms;
+}
+
+.tile:hover .tile__playIcon {
+  background: rgba(0, 0, 0, 0.85);
+}
+
+.tile__duration {
+  padding: 2px 6px;
+  color: #fff;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  background: rgba(0, 0, 0, 0.6);
+  border-radius: 4px;
+}
+
 .tile__meta {
   display: flex;
   flex-direction: column;
@@ -327,6 +373,88 @@ button:focus-visible {
   /* The overlay must never eat the drop: Tauri handles it at the OS level, but
      pointer-events here would also block hover state on the grid beneath. */
   pointer-events: none;
+}
+
+/* ---------- video player ---------- */
+
+.player {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  display: grid;
+  place-items: center;
+  padding: 32px;
+  background: rgba(0, 0, 0, 0.82);
+  backdrop-filter: blur(3px);
+}
+
+.player__frame {
+  display: flex;
+  flex-direction: column;
+  max-width: min(1100px, 100%);
+  max-height: 100%;
+  overflow: hidden;
+  background: var(--surface);
+  border-radius: 10px;
+}
+
+.player video {
+  display: block;
+  max-width: 100%;
+  /* Leave room for the caption bar so controls never sit off-screen. */
+  max-height: calc(100vh - 140px);
+  background: #000;
+}
+
+.player__fallback {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: center;
+  padding: 40px 32px;
+  text-align: center;
+}
+
+.player__fallback p {
+  margin: 0;
+}
+
+.player__fallbackDetail {
+  color: var(--ink-dim);
+  font-size: 12px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+.player__fallback button {
+  margin-top: 8px;
+  padding: 8px 14px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.player__meta {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  font-size: 12px;
+  border-top: 1px solid var(--line);
+}
+
+.player__meta button {
+  padding: 0 6px;
+  font-size: 18px;
+  line-height: 1;
+  color: var(--ink-dim);
+  background: none;
+  border: none;
+  cursor: pointer;
 }
 
 .dropzone p {

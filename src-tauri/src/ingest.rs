@@ -22,7 +22,8 @@ use serde::Serialize;
 use crate::color::{palette_from_pixels, Swatch};
 use crate::error::{Error, Result};
 use crate::image_ops::{self, THUMB_LONG_EDGE};
-use crate::store::{hash_bytes, Library};
+use crate::store::{self, Library};
+use crate::video;
 
 /// Palette size. Five reads as a palette strip in the UI and is enough to
 /// cover an image's structure without splitting near-identical shades.
@@ -33,11 +34,37 @@ const PALETTE_SIZE: usize = 5;
 /// can exhaust RAM on a 16GB machine.
 const DECODE_CHUNK: usize = 16;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MediaKind {
+    Image,
+    Video,
+}
+
+impl MediaKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            MediaKind::Image => "image",
+            MediaKind::Video => "video",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "video" => MediaKind::Video,
+            _ => MediaKind::Image,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetRow {
     pub id: i64,
     pub hash: String,
+    pub kind: MediaKind,
+    /// Present for video only.
+    pub duration_ms: Option<i64>,
     pub ext: String,
     pub mime: String,
     pub width: u32,
@@ -50,6 +77,9 @@ pub struct AssetRow {
     /// Absolute path to the thumbnail, included on every row so the grid does
     /// not need one IPC round-trip per tile to render.
     pub thumb_path: String,
+    /// Absolute path to the stored original. Used for video playback; images
+    /// render from the thumbnail.
+    pub blob_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -70,35 +100,62 @@ pub struct ImportReport {
 /// Everything computed off-thread, ready for a DB insert.
 struct Prepared {
     hash: String,
-    ext: &'static str,
-    mime: &'static str,
+    kind: MediaKind,
+    ext: String,
+    mime: String,
     width: u32,
     height: u32,
     bytes: i64,
+    duration_ms: Option<i64>,
     original_name: Option<String>,
     swatches: Vec<Swatch>,
 }
 
-/// Extensions collected when walking a dropped directory.
+/// Bytes read for format sniffing. Every container we care about declares
+/// itself well inside this, and it keeps detection off the 2GB read path.
+const HEADER_SNIFF_BYTES: usize = 4096;
+
+/// Still-image extensions collected when walking a dropped directory.
 ///
 /// Files named explicitly are always attempted regardless of extension --
-/// `format_of` sniffs the real type from content. This list only gates
-/// *discovered* files, so dropping a project folder does not turn its .txt,
-/// .psd and .ai files into a wall of failures the user has to scroll past.
-const WALK_EXTENSIONS: &[&str] = &[
+/// format is sniffed from content. This list only gates *discovered* files, so
+/// dropping a project folder does not turn its .txt, .psd and .ai files into a
+/// wall of failures the user has to scroll past.
+const IMAGE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "webp", "gif", "avif", "bmp", "tif", "tiff", "ico",
 ];
+
+/// Container extension to MIME. Only mp4 and webm play in WebView2; the rest
+/// are stored and openable but will not render in an inline `<video>`.
+fn video_mime(ext: &str) -> &'static str {
+    match ext {
+        "mp4" | "m4v" => "video/mp4",
+        "webm" => "video/webm",
+        "mov" => "video/quicktime",
+        "mkv" => "video/x-matroska",
+        "avi" => "video/x-msvideo",
+        "wmv" => "video/x-ms-wmv",
+        "flv" => "video/x-flv",
+        "ts" | "m2ts" => "video/mp2t",
+        _ => "video/mpeg",
+    }
+}
 
 /// Recursion cap for directory walks. Windows makes junctions and symlinks
 /// easy to create by accident, and `read_dir` follows them happily -- without
 /// a cap a cyclic junction is an infinite walk.
 const MAX_WALK_DEPTH: usize = 8;
 
-fn has_image_extension(path: &Path) -> bool {
+fn extension_of(path: &Path) -> Option<String> {
     path.extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| WALK_EXTENSIONS.contains(&e.as_str()))
+}
+
+fn is_media_extension(path: &Path) -> bool {
+    extension_of(path).is_some_and(|e| {
+        IMAGE_EXTENSIONS.contains(&e.as_str()) || video::VIDEO_EXTENSIONS.contains(&e.as_str())
+    })
 }
 
 fn walk_into(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -114,7 +171,7 @@ fn walk_into(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             walk_into(&path, depth + 1, out);
-        } else if has_image_extension(&path) {
+        } else if is_media_extension(&path) {
             out.push(path);
         }
     }
@@ -165,13 +222,15 @@ pub fn import_paths(
     }
 
     // --- Phase 1: hash in parallel ---
+    // Memory-mapped, so a 2GB video costs no heap. The previous `fs::read` here
+    // was invisible for images and would have been ruinous for video.
     let hashed: Vec<std::result::Result<(PathBuf, String), FailedImport>> = paths
         .par_iter()
-        .map(|path| match std::fs::read(path) {
-            Ok(bytes) => Ok((path.clone(), hash_bytes(&bytes))),
+        .map(|path| match store::hash_file(path) {
+            Ok(hash) => Ok((path.clone(), hash)),
             Err(e) => Err(FailedImport {
                 path: path.display().to_string(),
-                reason: Error::io(path, e).to_string(),
+                reason: e.to_string(),
             }),
         })
         .collect();
@@ -228,10 +287,13 @@ pub fn import_paths(
     for p in &prepared {
         tx.execute(
             "INSERT INTO assets
-                (hash, ext, mime, width, height, bytes, original_name, imported_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                (hash, kind, duration_ms, ext, mime, width, height, bytes,
+                 original_name, imported_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 p.hash,
+                p.kind.as_str(),
+                p.duration_ms,
                 p.ext,
                 p.mime,
                 p.width,
@@ -254,8 +316,10 @@ pub fn import_paths(
         report.imported.push(AssetRow {
             id,
             hash: p.hash.clone(),
-            ext: p.ext.to_string(),
-            mime: p.mime.to_string(),
+            kind: p.kind,
+            duration_ms: p.duration_ms,
+            ext: p.ext.clone(),
+            mime: p.mime.clone(),
             width: p.width,
             height: p.height,
             bytes: p.bytes,
@@ -264,6 +328,7 @@ pub fn import_paths(
             imported_at,
             swatches: p.swatches.clone(),
             thumb_path: lib.thumb_path(&p.hash).display().to_string(),
+            blob_path: lib.blob_path(&p.hash, &p.ext).display().to_string(),
         });
     }
     tx.commit()?;
@@ -271,18 +336,47 @@ pub fn import_paths(
     Ok(report)
 }
 
+/// Classifies by content, not by filename.
+///
+/// Image formats declare themselves in their first few bytes, so a header
+/// sniff settles those cheaply. Anything else is offered to ffprobe, which is
+/// the only reliable way to tell a real .mp4 from something merely named one.
 fn prepare_one(lib: &Library, path: &Path, hash: &str) -> Result<Prepared> {
+    let header = store::read_header(path, HEADER_SNIFF_BYTES)?;
+
+    if let Some((ext, mime)) = image_ops::format_of(&header) {
+        return prepare_image(lib, path, hash, ext, mime);
+    }
+    if let Some(info) = video::probe(path)? {
+        return prepare_video(lib, path, hash, info);
+    }
+    Err(Error::Unsupported(path.to_path_buf()))
+}
+
+fn prepare_image(
+    lib: &Library,
+    path: &Path,
+    hash: &str,
+    ext: &str,
+    mime: &str,
+) -> Result<Prepared> {
     let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
-
-    let (ext, mime) =
-        image_ops::format_of(&bytes).ok_or_else(|| Error::Unsupported(path.to_path_buf()))?;
-
     let image = image_ops::decode(path, &bytes)?;
-    let width = image.width();
-    let height = image.height();
+
+    let prepared = Prepared {
+        hash: hash.to_string(),
+        kind: MediaKind::Image,
+        ext: ext.to_string(),
+        mime: mime.to_string(),
+        width: image.width(),
+        height: image.height(),
+        bytes: bytes.len() as i64,
+        duration_ms: None,
+        original_name: file_name_of(path),
+        swatches: palette_from_pixels(&image_ops::palette_samples(&image), PALETTE_SIZE),
+    };
 
     let thumb = image_ops::encode_webp(&image_ops::thumbnail(&image, THUMB_LONG_EDGE))?;
-    let swatches = palette_from_pixels(&image_ops::palette_samples(&image), PALETTE_SIZE);
 
     // Blobs are written before the DB row exists. That ordering means a crash
     // between the two leaves an orphaned blob -- wasted disk, reclaimable by a
@@ -291,13 +385,56 @@ fn prepare_one(lib: &Library, path: &Path, hash: &str) -> Result<Prepared> {
     lib.write_if_absent(&lib.blob_path(hash, ext), &bytes)?;
     lib.write_if_absent(&lib.thumb_path(hash), &thumb)?;
 
+    Ok(prepared)
+}
+
+fn prepare_video(
+    lib: &Library,
+    path: &Path,
+    hash: &str,
+    info: video::VideoInfo,
+) -> Result<Prepared> {
+    // Container comes from the extension because ffprobe reports the codec,
+    // not the wrapper, and the wrapper is what decides playability.
+    let ext = extension_of(path).unwrap_or_else(|| "mp4".to_string());
+    let mime = video_mime(&ext);
+
+    // The poster frame goes through the exact same thumbnail and OkLab palette
+    // path as a still, so colour search works across video for free.
+    let frame_png = video::extract_poster_frame(path, info.duration_ms)?;
+    let frame = image_ops::decode(path, &frame_png)?;
+
+    let thumb = image_ops::encode_webp(&image_ops::thumbnail(&frame, THUMB_LONG_EDGE))?;
+    let swatches = palette_from_pixels(&image_ops::palette_samples(&frame), PALETTE_SIZE);
+
+    let size = std::fs::metadata(path)
+        .map(|m| m.len() as i64)
+        .map_err(|e| Error::io(path, e))?;
+
+    // Streamed, never buffered -- this is the whole reason video forced the
+    // hashing and blob paths off `fs::read`.
+    lib.copy_if_absent(&lib.blob_path(hash, &ext), path)?;
+    lib.write_if_absent(&lib.thumb_path(hash), &thumb)?;
+
     Ok(Prepared {
         hash: hash.to_string(),
+        kind: MediaKind::Video,
         ext,
-        mime,
-        width,
-        height,
-        bytes: bytes.len() as i64,
+        mime: mime.to_string(),
+        // Dimensions come from the stream, not the decoded frame: ffmpeg may
+        // hand back a frame with square pixels where the stream is anamorphic.
+        width: if info.width > 0 {
+            info.width
+        } else {
+            frame.width()
+        },
+        height: if info.height > 0 {
+            info.height
+        } else {
+            frame.height()
+        },
+        bytes: size,
+        duration_ms: Some(info.duration_ms),
         original_name: file_name_of(path),
         swatches,
     })
@@ -311,7 +448,8 @@ pub fn list_assets(
     offset: i64,
 ) -> Result<Vec<AssetRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, hash, ext, mime, width, height, bytes, original_name, source_url, imported_at
+        "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
+                original_name, source_url, imported_at
          FROM assets ORDER BY imported_at DESC, id DESC LIMIT ?1 OFFSET ?2",
     )?;
     let rows = stmt
@@ -320,15 +458,21 @@ pub fn list_assets(
             Ok(AssetRow {
                 id: r.get(0)?,
                 thumb_path: lib.thumb_path(&hash).display().to_string(),
+                blob_path: lib
+                    .blob_path(&hash, &r.get::<_, String>(4)?)
+                    .display()
+                    .to_string(),
                 hash,
-                ext: r.get(2)?,
-                mime: r.get(3)?,
-                width: r.get(4)?,
-                height: r.get(5)?,
-                bytes: r.get(6)?,
-                original_name: r.get(7)?,
-                source_url: r.get(8)?,
-                imported_at: r.get(9)?,
+                kind: MediaKind::from_str(&r.get::<_, String>(2)?),
+                duration_ms: r.get(3)?,
+                ext: r.get(4)?,
+                mime: r.get(5)?,
+                width: r.get(6)?,
+                height: r.get(7)?,
+                bytes: r.get(8)?,
+                original_name: r.get(9)?,
+                source_url: r.get(10)?,
+                imported_at: r.get(11)?,
                 swatches: Vec::new(),
             })
         })?
@@ -438,7 +582,8 @@ pub fn search_by_color(
 
 fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
     let mut stmt = conn.prepare(
-        "SELECT id, hash, ext, mime, width, height, bytes, original_name, source_url, imported_at
+        "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
+                original_name, source_url, imported_at
          FROM assets WHERE id = ?1",
     )?;
     let mut rows = stmt.query([id])?;
@@ -449,15 +594,21 @@ fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<Asset
     let mut asset = AssetRow {
         id: r.get(0)?,
         thumb_path: lib.thumb_path(&hash).display().to_string(),
+        blob_path: lib
+            .blob_path(&hash, &r.get::<_, String>(4)?)
+            .display()
+            .to_string(),
         hash,
-        ext: r.get(2)?,
-        mime: r.get(3)?,
-        width: r.get(4)?,
-        height: r.get(5)?,
-        bytes: r.get(6)?,
-        original_name: r.get(7)?,
-        source_url: r.get(8)?,
-        imported_at: r.get(9)?,
+        kind: MediaKind::from_str(&r.get::<_, String>(2)?),
+        duration_ms: r.get(3)?,
+        ext: r.get(4)?,
+        mime: r.get(5)?,
+        width: r.get(6)?,
+        height: r.get(7)?,
+        bytes: r.get(8)?,
+        original_name: r.get(9)?,
+        source_url: r.get(10)?,
+        imported_at: r.get(11)?,
         swatches: Vec::new(),
     };
     drop(rows);
@@ -657,6 +808,136 @@ mod tests {
 
         let report = import_paths(&fx.lib, &mut fx.conn, &[empty]).expect("import");
         assert_eq!(report.imported.len(), 0);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+    }
+
+    /// Renders a real clip so video ingest is exercised end to end rather than
+    /// against a stub. Returns None when ffmpeg is unavailable.
+    fn write_video(dir: &Path, name: &str, seconds: u32) -> Option<PathBuf> {
+        if !crate::video::tooling_available() {
+            return None;
+        }
+        let path = dir.join(name);
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=size=640x360:rate=15:duration={seconds}"),
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .ok()?;
+        ok.success().then_some(path)
+    }
+
+    #[test]
+    fn importing_a_video_stores_it_with_a_poster_thumbnail() {
+        let mut fx = Fixture::new("video-basic");
+        let Some(path) = write_video(&fx.dir.join("src"), "clip.mp4", 3) else {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        };
+
+        let report = import_paths(&fx.lib, &mut fx.conn, &[path]).expect("import");
+        assert_eq!(report.imported.len(), 1, "{:?}", report.failed);
+
+        let asset = &report.imported[0];
+        assert_eq!(asset.kind, MediaKind::Video);
+        assert_eq!((asset.width, asset.height), (640, 360));
+        assert_eq!(asset.ext, "mp4");
+        assert_eq!(asset.mime, "video/mp4");
+
+        let duration = asset.duration_ms.expect("video must carry a duration");
+        assert!(
+            (duration - 3000).abs() < 400,
+            "expected ~3000ms, got {duration}"
+        );
+
+        // The original is copied, and a poster thumbnail exists beside it.
+        assert!(
+            fx.lib.blob_path(&asset.hash, "mp4").exists(),
+            "blob missing"
+        );
+        assert!(fx.lib.thumb_path(&asset.hash).exists(), "thumb missing");
+
+        // Colour search must work on video, which means the poster frame went
+        // through the same palette path as a still -- and was not black.
+        assert!(!asset.swatches.is_empty(), "video produced no palette");
+        assert!(
+            asset.swatches.iter().any(|s| s.l > 0.15),
+            "palette is all near-black, so the poster frame was probably frame 0: {:?}",
+            asset.swatches
+        );
+    }
+
+    #[test]
+    fn images_and_video_import_in_one_batch() {
+        let mut fx = Fixture::new("mixed-batch");
+        let still = fx.write_png("shot.png", 20, 20, [200, 40, 40, 255]);
+        let Some(clip) = write_video(&fx.dir.join("src"), "clip.mp4", 2) else {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        };
+
+        let report = import_paths(&fx.lib, &mut fx.conn, &[still, clip]).expect("import");
+        assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
+
+        let kinds: Vec<MediaKind> = report.imported.iter().map(|a| a.kind).collect();
+        assert!(kinds.contains(&MediaKind::Image));
+        assert!(kinds.contains(&MediaKind::Video));
+    }
+
+    #[test]
+    fn a_video_dropped_twice_is_a_duplicate() {
+        let mut fx = Fixture::new("video-dupe");
+        let Some(path) = write_video(&fx.dir.join("src"), "clip.mp4", 2) else {
+            return;
+        };
+
+        assert_eq!(
+            import_paths(&fx.lib, &mut fx.conn, std::slice::from_ref(&path))
+                .unwrap()
+                .imported
+                .len(),
+            1
+        );
+        let second = import_paths(&fx.lib, &mut fx.conn, &[path]).unwrap();
+        assert_eq!(second.imported.len(), 0);
+        assert_eq!(
+            second.duplicates, 1,
+            "content addressing must cover video too"
+        );
+    }
+
+    #[test]
+    fn kind_and_duration_survive_a_round_trip_through_the_database() {
+        let mut fx = Fixture::new("video-roundtrip");
+        let Some(path) = write_video(&fx.dir.join("src"), "clip.mp4", 2) else {
+            return;
+        };
+        import_paths(&fx.lib, &mut fx.conn, &[path]).expect("import");
+
+        // Re-read through list_assets rather than trusting the insert-time row.
+        let listed = list_assets(&fx.lib, &fx.conn, 10, 0).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].kind, MediaKind::Video);
+        assert!(listed[0].duration_ms.unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn a_folder_of_mixed_media_walks_both_kinds() {
+        let mut fx = Fixture::new("video-walk");
+        fx.write_png("a.png", 8, 8, [3, 3, 3, 255]);
+        if write_video(&fx.dir.join("src"), "b.mov", 2).is_none() {
+            return;
+        }
+        std::fs::write(fx.dir.join("src").join("readme.txt"), b"ignore me").unwrap();
+
+        let report = import_paths(&fx.lib, &mut fx.conn, &[fx.dir.join("src")]).expect("import");
+        assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
     }
 

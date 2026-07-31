@@ -22,3 +22,14 @@ export const libraryRoot = () => invoke<string>("library_root");
  * as a broken image with nothing in the console to explain it.
  */
 export const thumbUrl = (asset: Asset) => convertFileSrc(asset.thumbPath);
+
+/** Playable URL for a stored video original. Same scope caveat as thumbUrl. */
+export const blobUrl = (asset: Asset) => convertFileSrc(asset.blobPath);
+
+/**
+ * WebView2 plays mp4 and webm; everything else is stored and openable but will
+ * not render in a `<video>` element. Container is necessary but not sufficient
+ * — an HEVC or AV1 mp4 still fails, which the player falls back from.
+ */
+export const isPlayableInline = (asset: Asset) =>
+  asset.mime === "video/mp4" || asset.mime === "video/webm";

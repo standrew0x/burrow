@@ -5,6 +5,7 @@ pub mod error;
 pub mod image_ops;
 pub mod ingest;
 pub mod store;
+pub mod video;
 
 use commands::AppState;
 use store::Library;

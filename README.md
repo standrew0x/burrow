@@ -62,8 +62,15 @@ free tier is 1 GiB storage and 1 GiB/month bandwidth, which a few CI runs
 exhaust.
 
 **Dev libraries live outside the repo.** This app's whole job is accumulating
-images. Point dev builds at `%LOCALAPPDATA%\burrow` — the same path shipping
-builds use. `fixtures/`, `dev-library/`, and `blobs/` are ignored as a
+images. Point dev builds at `%LOCALAPPDATA%\co.burrow.app` — the same path
+shipping builds use.
+
+That path is named for the **bundle identifier, not the product name**, and it
+must stay that way. NSIS per-user installs go to `$LOCALAPPDATA\<ProductName>`,
+so a library at `%LOCALAPPDATA%\Burrow` *is* the install directory — and NSIS
+clears `$INSTDIR` when installing over an existing version, taking `burrow.db`
+with it. `library_root_cannot_collide_with_the_installer` in `store.rs` guards
+this. `fixtures/`, `dev-library/`, and `blobs/` are ignored as a
 backstop, but the habit matters more than the safety net.
 
 **CI runs on tags, not pushes.** Free-tier private repos get 2,000 CI

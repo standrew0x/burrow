@@ -55,6 +55,14 @@ const MIGRATIONS: &[&str] = &[
     -- pass and do not.
     CREATE INDEX swatches_l ON swatches(l);
     "#,
+    // --- v2: video ---
+    // Existing rows are all images, so the default backfills them correctly
+    // and no data migration is needed.
+    r#"
+    ALTER TABLE assets ADD COLUMN kind TEXT NOT NULL DEFAULT 'image';
+    ALTER TABLE assets ADD COLUMN duration_ms INTEGER;
+    CREATE INDEX assets_kind ON assets(kind);
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.
@@ -150,6 +158,57 @@ mod tests {
         conn.execute(insert, ["deadbeef"]).expect("first insert");
         // The dedupe guarantee is a DB constraint, not just application logic.
         assert!(conn.execute(insert, ["deadbeef"]).is_err());
+    }
+
+    #[test]
+    fn v2_adds_video_columns_and_defaults_existing_rows_to_image() {
+        let conn = open_in_memory().expect("open");
+        conn.execute(
+            "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+             VALUES ('abc', 'png', 'image/png', 1, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let (kind, duration): (String, Option<i64>) = conn
+            .query_row(
+                "SELECT kind, duration_ms FROM assets WHERE hash='abc'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(kind, "image", "rows predating v2 must read back as images");
+        assert_eq!(duration, None);
+    }
+
+    #[test]
+    fn a_v1_library_upgrades_in_place() {
+        // Simulate a library created before video support: apply only the first
+        // migration, then run the full migrator over it.
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        conn.execute_batch(&format!(
+            "BEGIN;\n{}\nPRAGMA user_version = 1;\nCOMMIT;",
+            MIGRATIONS[0]
+        ))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+             VALUES ('legacy', 'jpg', 'image/jpeg', 4, 4, 16, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).expect("upgrade v1 -> latest");
+
+        assert_eq!(schema_version(&conn).unwrap(), MIGRATIONS.len() as i64);
+        let kind: String = conn
+            .query_row("SELECT kind FROM assets WHERE hash='legacy'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(kind, "image", "existing row survived the upgrade");
     }
 
     #[test]

@@ -1,0 +1,314 @@
+//! Video probing and frame extraction, via ffmpeg/ffprobe as child processes.
+//!
+//! Shelling out rather than linking `ffmpeg-next`: the C bindings are a
+//! miserable build on Windows/MSVC, and a process boundary keeps ffmpeg's
+//! licence from reaching into this binary. The cost is that ffmpeg must be on
+//! PATH, which is checked with a clear error rather than a mystery failure.
+
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+use serde::Deserialize;
+
+use crate::error::{Error, Result};
+
+/// Container extensions offered to the directory walker and drag-drop.
+/// Actual format is confirmed by ffprobe, not by this list.
+pub const VIDEO_EXTENSIONS: &[&str] = &[
+    "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "flv", "mpg", "mpeg", "m2ts", "ts",
+];
+
+/// Where to grab the poster frame, as a fraction of duration.
+///
+/// Not frame 0: videos routinely open on black, a fade-in, or a slate, and a
+/// black thumbnail is both useless in the grid and poisons the OkLab palette
+/// with a colour the video does not actually contain.
+const POSTER_FRACTION: f64 = 0.10;
+const POSTER_MIN_SECONDS: f64 = 0.5;
+const POSTER_MAX_SECONDS: f64 = 10.0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct VideoInfo {
+    pub width: u32,
+    pub height: u32,
+    pub duration_ms: i64,
+    pub codec: String,
+    pub has_audio: bool,
+}
+
+// --- ffprobe JSON shape (only the fields we consume) ---
+
+#[derive(Deserialize)]
+struct ProbeOutput {
+    #[serde(default)]
+    streams: Vec<ProbeStream>,
+    #[serde(default)]
+    format: Option<ProbeFormat>,
+}
+
+#[derive(Deserialize)]
+struct ProbeStream {
+    #[serde(default)]
+    codec_type: String,
+    #[serde(default)]
+    codec_name: String,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    #[serde(default)]
+    duration: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ProbeFormat {
+    #[serde(default)]
+    duration: Option<String>,
+}
+
+fn tool_missing(tool: &str, e: &std::io::Error) -> Error {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        Error::Ffmpeg(format!(
+            "{tool} was not found on PATH. Install it (winget install Gyan.FFmpeg) \
+             to import video."
+        ))
+    } else {
+        Error::Ffmpeg(format!("could not run {tool}: {e}"))
+    }
+}
+
+/// True when both tools can be executed. Used to give one clear message up
+/// front instead of one failure per dropped file.
+pub fn tooling_available() -> bool {
+    ["ffprobe", "ffmpeg"].iter().all(|tool| {
+        Command::new(tool)
+            .arg("-version")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok()
+    })
+}
+
+/// Reads stream metadata. `Ok(None)` means the file has no video stream --
+/// an audio file, or something ffprobe understands but we do not want.
+pub fn probe(path: &Path) -> Result<Option<VideoInfo>> {
+    let output = Command::new("ffprobe")
+        .args([
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type,codec_name,width,height,duration",
+            "-show_entries",
+            "format=duration",
+            "-print_format",
+            "json",
+        ])
+        .arg(path)
+        .output()
+        .map_err(|e| tool_missing("ffprobe", &e))?;
+
+    if !output.status.success() {
+        // Not an error: ffprobe rejects non-media files, which is how a .txt
+        // gets classified rather than crashing the import.
+        return Ok(None);
+    }
+
+    let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)
+        .map_err(|e| Error::Ffmpeg(format!("could not parse ffprobe output: {e}")))?;
+
+    let has_audio = parsed.streams.iter().any(|s| s.codec_type == "audio");
+
+    let Some(video) = parsed.streams.iter().find(|s| s.codec_type == "video") else {
+        return Ok(None);
+    };
+
+    // Some containers (notably MKV) omit per-stream duration and only carry it
+    // at format level, so fall back rather than reporting a 0-length video.
+    let seconds = video
+        .duration
+        .as_deref()
+        .and_then(|d| d.parse::<f64>().ok())
+        .or_else(|| {
+            parsed
+                .format
+                .as_ref()
+                .and_then(|f| f.duration.as_deref())
+                .and_then(|d| d.parse::<f64>().ok())
+        })
+        .unwrap_or(0.0);
+
+    Ok(Some(VideoInfo {
+        width: video.width.unwrap_or(0),
+        height: video.height.unwrap_or(0),
+        duration_ms: (seconds * 1000.0).round().max(0.0) as i64,
+        codec: video.codec_name.clone(),
+        has_audio,
+    }))
+}
+
+/// Seek offset for the poster frame, in seconds.
+pub fn poster_offset_seconds(duration_ms: i64) -> f64 {
+    if duration_ms <= 0 {
+        return 0.0;
+    }
+    let seconds = duration_ms as f64 / 1000.0;
+    (seconds * POSTER_FRACTION)
+        .clamp(POSTER_MIN_SECONDS, POSTER_MAX_SECONDS)
+        // Never seek past the end -- a 1s clip would otherwise seek to 0.5s of
+        // a 0.5s remainder and decode nothing.
+        .min(seconds * 0.9)
+}
+
+/// Decodes one frame and returns it as PNG bytes.
+///
+/// Piped through stdout rather than a temp file: no cleanup, no collisions
+/// between parallel imports, and the frame is small enough to hold in memory.
+pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
+    let offset = poster_offset_seconds(duration_ms);
+
+    let output = Command::new("ffmpeg")
+        .args(["-v", "error"])
+        // -ss BEFORE -i is the fast path: ffmpeg seeks the container instead of
+        // decoding every frame up to the offset. On a long video that is the
+        // difference between milliseconds and tens of seconds.
+        .args(["-ss", &format!("{offset:.3}")])
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-an",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ])
+        .output()
+        .map_err(|e| tool_missing("ffmpeg", &e))?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().last().unwrap_or("no output").trim();
+        return Err(Error::Ffmpeg(format!(
+            "could not extract a frame from {}: {detail}",
+            path.display()
+        )));
+    }
+
+    Ok(output.stdout)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Renders a few seconds of colour bars so the tests exercise real ffmpeg
+    /// rather than mocking it. Returns None when ffmpeg is unavailable.
+    fn synth_video(name: &str, seconds: u32) -> Option<std::path::PathBuf> {
+        if !tooling_available() {
+            return None;
+        }
+        let path =
+            std::env::temp_dir().join(format!("burrow-vid-{}-{name}.mp4", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let status = Command::new("ffmpeg")
+            .args(["-v", "error", "-y"])
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc=size=320x240:rate=10:duration={seconds}"),
+            ])
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status()
+            .ok()?;
+        status.success().then_some(path)
+    }
+
+    #[test]
+    fn poster_offset_is_clamped_and_never_past_the_end() {
+        // 10% of a 100s video, within bounds.
+        assert!((poster_offset_seconds(100_000) - 10.0).abs() < 1e-6);
+        // Long video: capped rather than seeking minutes in.
+        assert!((poster_offset_seconds(3_600_000) - POSTER_MAX_SECONDS).abs() < 1e-6);
+        // Very short clip: must stay inside the clip.
+        let short = poster_offset_seconds(1_000);
+        assert!(short < 1.0, "offset {short} would seek past a 1s clip");
+        // Degenerate input must not panic or go negative.
+        assert_eq!(poster_offset_seconds(0), 0.0);
+        assert_eq!(poster_offset_seconds(-5), 0.0);
+    }
+
+    #[test]
+    fn probe_reads_dimensions_and_duration() {
+        let Some(path) = synth_video("probe", 3) else {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        };
+        let info = probe(&path)
+            .expect("probe")
+            .expect("should have a video stream");
+
+        assert_eq!((info.width, info.height), (320, 240));
+        assert!(
+            (info.duration_ms - 3000).abs() < 400,
+            "expected ~3000ms, got {}",
+            info.duration_ms
+        );
+        assert!(!info.codec.is_empty());
+        assert!(!info.has_audio, "testsrc has no audio track");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn probe_returns_none_for_a_non_video() {
+        if !tooling_available() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("burrow-notvid-{}.txt", std::process::id()));
+        std::fs::write(&path, b"definitely not a video").unwrap();
+
+        assert_eq!(probe(&path).expect("probe should not error"), None);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn extracted_frame_is_a_decodable_png() {
+        let Some(path) = synth_video("frame", 3) else {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        };
+        let info = probe(&path).unwrap().unwrap();
+        let png = extract_poster_frame(&path, info.duration_ms).expect("extract");
+
+        assert_eq!(&png[1..4], b"PNG");
+        let decoded = image::load_from_memory(&png).expect("frame should decode");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (320, 240),
+            "frame should match the source dimensions"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn extract_reports_a_useful_error_for_a_broken_file() {
+        if !tooling_available() {
+            return;
+        }
+        let path = std::env::temp_dir().join(format!("burrow-broken-{}.mp4", std::process::id()));
+        std::fs::write(&path, b"not actually an mp4").unwrap();
+
+        let err = extract_poster_frame(&path, 1000).unwrap_err();
+        assert!(
+            err.to_string().contains("burrow-broken"),
+            "error should name the file, got: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+}

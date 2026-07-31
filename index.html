@@ -3,6 +3,9 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Empty data URI suppresses the automatic /favicon.ico request, which
+         otherwise 404s in the console. The window icon comes from tauri.conf.json. -->
+    <link rel="icon" href="data:," />
     <title>Burrow</title>
   </head>
 
