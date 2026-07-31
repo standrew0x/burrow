@@ -82,3 +82,73 @@ pub fn search_by_color(
 pub fn library_root(state: tauri::State<'_, AppState>) -> String {
     state.library.root().display().to_string()
 }
+
+// --- boards ---
+
+#[tauri::command]
+pub fn list_boards(state: tauri::State<'_, AppState>) -> Result<Vec<crate::boards::Board>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::list_boards(&state.library, &conn)
+}
+
+#[tauri::command]
+pub fn create_board(
+    state: tauri::State<'_, AppState>,
+    name: String,
+) -> Result<crate::boards::Board> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::create_board(&conn, &name)
+}
+
+#[tauri::command]
+pub fn rename_board(
+    state: tauri::State<'_, AppState>,
+    id: i64,
+    name: String,
+) -> Result<crate::boards::Board> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::rename_board(&conn, id, &name)
+}
+
+#[tauri::command]
+pub fn delete_board(state: tauri::State<'_, AppState>, id: i64) -> Result<()> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::delete_board(&conn, id)
+}
+
+#[tauri::command]
+pub fn add_to_board(
+    state: tauri::State<'_, AppState>,
+    board_id: i64,
+    asset_ids: Vec<i64>,
+) -> Result<usize> {
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::add_to_board(&mut conn, board_id, &asset_ids)
+}
+
+#[tauri::command]
+pub fn remove_from_board(
+    state: tauri::State<'_, AppState>,
+    board_id: i64,
+    asset_ids: Vec<i64>,
+) -> Result<usize> {
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::remove_from_board(&mut conn, board_id, &asset_ids)
+}
+
+#[tauri::command]
+pub fn list_board_assets(
+    state: tauri::State<'_, AppState>,
+    board_id: i64,
+    limit: Option<i64>,
+    offset: Option<i64>,
+) -> Result<Vec<AssetRow>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::list_board_assets(
+        &state.library,
+        &conn,
+        board_id,
+        limit.unwrap_or(DEFAULT_PAGE_SIZE),
+        offset.unwrap_or(0),
+    )
+}

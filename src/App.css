@@ -40,7 +40,135 @@ body {
 }
 
 .app {
+  display: grid;
+  grid-template-columns: 232px minmax(0, 1fr);
   min-height: 100vh;
+  background: var(--bg);
+}
+
+.main {
+  /* minmax(0,1fr) above plus this keeps the masonry columns from forcing the
+     grid track wider than the viewport. */
+  min-width: 0;
+}
+
+/* ---------- board rail ---------- */
+
+.rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  padding: 12px 8px;
+  overflow-y: auto;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+}
+
+.rail__heading {
+  padding: 14px 8px 6px;
+  color: var(--ink-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.rail__empty {
+  margin: 0;
+  padding: 0 8px;
+  color: var(--ink-dim);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.rail__row {
+  display: flex;
+  align-items: center;
+  border-radius: 7px;
+}
+
+.rail__row:hover {
+  background: var(--surface-2);
+}
+
+.rail__item {
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  align-items: center;
+  min-width: 0;
+  padding: 7px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.rail > .rail__item:hover {
+  background: var(--surface-2);
+}
+
+.rail__item--active,
+.rail__row.rail__item--active {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+}
+
+.rail__name {
+  flex: 1;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.rail__count {
+  color: var(--ink-dim);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.rail__cover {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  object-fit: cover;
+  border-radius: 4px;
+}
+
+.rail__cover--empty {
+  background: var(--surface-2);
+  border: 1px dashed var(--line);
+}
+
+/* Row actions stay hidden until hover so the rail reads as a list, not a
+   control panel. */
+.rail__actions {
+  display: none;
+  gap: 2px;
+  padding-right: 4px;
+}
+
+.rail__row:hover .rail__actions {
+  display: flex;
+}
+
+.rail__actions button {
+  padding: 2px 5px;
+  font-size: 12px;
+  line-height: 1;
+  color: var(--ink-dim);
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+}
+
+.rail__actions button:hover {
+  color: var(--ink);
   background: var(--bg);
 }
 
@@ -373,6 +501,92 @@ button:focus-visible {
   /* The overlay must never eat the drop: Tauri handles it at the OS level, but
      pointer-events here would also block hover state on the grid beneath. */
   pointer-events: none;
+}
+
+/* ---------- selection ---------- */
+
+.tile--selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+/* Sits above .tile__play, which covers the whole media box; without the
+   z-index the play button would swallow every selection click on video. */
+.tile__select {
+  position: absolute;
+  top: 7px;
+  left: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font-size: 11px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.45);
+  border: 1.5px solid rgba(255, 255, 255, 0.85);
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 100ms;
+}
+
+.tile:hover .tile__select,
+.tile__select:focus-visible,
+.tile__select--on {
+  opacity: 1;
+}
+
+.tile__select--on {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+/* ---------- selection tray ---------- */
+
+.tray {
+  position: fixed;
+  bottom: 20px;
+  left: 50%;
+  z-index: 25;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  font-size: 13px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.28);
+  transform: translateX(-50%);
+}
+
+.tray__count {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tray select,
+.tray button {
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.tray select:hover,
+.tray button:hover {
+  border-color: var(--accent);
+}
+
+.tray__clear {
+  color: var(--ink-dim);
 }
 
 /* ---------- video player ---------- */

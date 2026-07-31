@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
-import type { Asset, ColorMatch, ImportReport } from "./types";
+import type { Asset, Board, ColorMatch, ImportReport } from "./types";
 
 export const listAssets = (limit?: number, offset?: number) =>
   invoke<Asset[]>("list_assets", { limit, offset });
@@ -33,3 +33,25 @@ export const blobUrl = (asset: Asset) => convertFileSrc(asset.blobPath);
  */
 export const isPlayableInline = (asset: Asset) =>
   asset.mime === "video/mp4" || asset.mime === "video/webm";
+
+// --- boards ---
+
+export const listBoards = () => invoke<Board[]>("list_boards");
+
+/** Get-or-create: an existing name (case-insensitive) returns that board. */
+export const createBoard = (name: string) => invoke<Board>("create_board", { name });
+
+export const renameBoard = (id: number, name: string) =>
+  invoke<Board>("rename_board", { id, name });
+
+/** Deletes the board only — never the references on it. */
+export const deleteBoard = (id: number) => invoke<void>("delete_board", { id });
+
+export const addToBoard = (boardId: number, assetIds: number[]) =>
+  invoke<number>("add_to_board", { boardId, assetIds });
+
+export const removeFromBoard = (boardId: number, assetIds: number[]) =>
+  invoke<number>("remove_from_board", { boardId, assetIds });
+
+export const listBoardAssets = (boardId: number, limit?: number, offset?: number) =>
+  invoke<Asset[]>("list_board_assets", { boardId, limit, offset });

@@ -63,6 +63,27 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE assets ADD COLUMN duration_ms INTEGER;
     CREATE INDEX assets_kind ON assets(kind);
     "#,
+    // --- v3: boards ---
+    r#"
+    CREATE TABLE boards (
+        id         INTEGER PRIMARY KEY,
+        -- NOCASE so "Title Cards" and "title cards" cannot both exist; users
+        -- reach for a board by name and two casings read as one board.
+        name       TEXT    NOT NULL UNIQUE COLLATE NOCASE,
+        created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE board_items (
+        board_id INTEGER NOT NULL REFERENCES boards(id) ON DELETE CASCADE,
+        asset_id INTEGER NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+        added_at INTEGER NOT NULL,
+        -- Composite key makes adding the same asset twice a no-op rather than
+        -- a duplicate tile.
+        PRIMARY KEY (board_id, asset_id)
+    );
+    -- Deleting an asset must cascade cheaply from the asset side too.
+    CREATE INDEX board_items_asset ON board_items(asset_id);
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.

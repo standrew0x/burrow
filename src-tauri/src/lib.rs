@@ -1,3 +1,4 @@
+pub mod boards;
 pub mod color;
 pub mod commands;
 pub mod db;
@@ -24,6 +25,13 @@ pub fn run() {
             commands::list_assets,
             commands::search_by_color,
             commands::library_root,
+            commands::list_boards,
+            commands::create_board,
+            commands::rename_board,
+            commands::delete_board,
+            commands::add_to_board,
+            commands::remove_from_board,
+            commands::list_board_assets,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

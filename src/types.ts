@@ -51,3 +51,12 @@ export interface ColorMatch {
   /** OkLab distance from the query colour to the closest swatch. */
   distance: number;
 }
+
+export interface Board {
+  id: number;
+  name: string;
+  createdAt: number;
+  itemCount: number;
+  /** Thumbnail of the newest item; null for an empty board. */
+  coverThumbPath: string | null;
+}

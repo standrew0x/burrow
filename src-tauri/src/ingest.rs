@@ -580,7 +580,7 @@ pub fn search_by_color(
     Ok(out)
 }
 
-fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
+pub(crate) fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
     let mut stmt = conn.prepare(
         "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
                 original_name, source_url, imported_at
