@@ -6,6 +6,7 @@ import {
   addToBoard,
   blobUrl,
   createBoard,
+  deleteAssets,
   deleteBoard,
   importPaths,
   isPlayableInline,
@@ -13,6 +14,7 @@ import {
   listAssets,
   listBoardAssets,
   listBoards,
+  moveToBoard,
   removeFromBoard,
   renameBoard,
   searchByColor,
@@ -25,6 +27,8 @@ interface Notice {
   imported: number;
   duplicates: number;
   failed: FailedImport[];
+  deleted?: number;
+  bytesFreed?: number;
 }
 
 /** OkLab search radius. See DEFAULT_COLOR_TOLERANCE in commands.rs for how
@@ -233,6 +237,50 @@ export default function App() {
     }
   };
 
+  const moveSelectionTo = async (toBoardId: number) => {
+    if (activeBoardId === null) return;
+    try {
+      await moveToBoard(activeBoardId, toBoardId, [...selected]);
+      clearSelection();
+      await refresh();
+      await refreshBoards();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  /** The only irreversible action in the app, so it states exactly what goes. */
+  const deleteSelection = async () => {
+    const count = selected.size;
+    const confirmed = window.confirm(
+      `Permanently delete ${count} reference${count === 1 ? "" : "s"}?\n\n` +
+        `The stored file${count === 1 ? "" : "s"} and thumbnail${count === 1 ? "" : "s"} ` +
+        `will be erased from your library, and ${count === 1 ? "it" : "they"} will be ` +
+        `removed from every board.\n\nYour original file${count === 1 ? "" : "s"} on disk ` +
+        `${count === 1 ? "is" : "are"} not touched. This cannot be undone.`,
+    );
+    if (!confirmed) return;
+
+    try {
+      const report = await deleteAssets([...selected]);
+      clearSelection();
+      setNotice({
+        imported: 0,
+        duplicates: 0,
+        failed: report.orphanedFiles.map((path) => ({
+          path,
+          reason: "row deleted, but the file could not be unlinked",
+        })),
+        deleted: report.deleted,
+        bytesFreed: report.bytesFreed,
+      });
+      await refresh();
+      await refreshBoards();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const heading = useMemo(() => {
     if (loading) return "Loading library…";
     if (importingCount !== null) {
@@ -370,8 +418,17 @@ export default function App() {
 
         {notice && (
           <div className="banner">
-            <strong>{notice.imported}</strong> imported
-            {notice.duplicates > 0 && <> · {notice.duplicates} already in library</>}
+            {notice.deleted !== undefined ? (
+              <>
+                <strong>{notice.deleted}</strong> deleted
+                {notice.bytesFreed ? <> · {formatBytes(notice.bytesFreed)} freed</> : null}
+              </>
+            ) : (
+              <>
+                <strong>{notice.imported}</strong> imported
+                {notice.duplicates > 0 && <> · {notice.duplicates} already in library</>}
+              </>
+            )}
             {notice.failed.length > 0 && <> · {notice.failed.length} failed</>}
             <button
               type="button"
@@ -525,11 +582,45 @@ export default function App() {
             <option value="__new">＋ New board…</option>
           </select>
 
+          {/* Moving only makes sense from a board — from the library there is
+              no source to move out of, which is what "Add to board" is for. */}
+          {activeBoard && boards.length > 1 && (
+            <select
+              className="tray__picker"
+              defaultValue=""
+              onChange={(e) => {
+                const value = e.target.value;
+                e.target.value = "";
+                if (value) void moveSelectionTo(Number(value));
+              }}
+            >
+              <option value="" disabled>
+                Move to…
+              </option>
+              {boards
+                .filter((b) => b.id !== activeBoard.id)
+                .map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}
+                  </option>
+                ))}
+            </select>
+          )}
+
           {activeBoard && (
             <button type="button" onClick={() => void removeSelectionFromBoard()}>
-              Remove from {activeBoard.name}
+              Remove from board
             </button>
           )}
+
+          <button
+            type="button"
+            className="tray__delete"
+            onClick={() => void deleteSelection()}
+            title="Erase from the library and delete the stored files"
+          >
+            Delete…
+          </button>
 
           <button type="button" className="tray__clear" onClick={clearSelection}>
             Clear

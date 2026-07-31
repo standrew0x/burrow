@@ -440,6 +440,75 @@ fn prepare_video(
     })
 }
 
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DeleteReport {
+    pub deleted: usize,
+    pub bytes_freed: i64,
+    /// Rows removed whose blob or thumbnail could not be unlinked -- usually a
+    /// file lock. The reference is gone from the library either way; this is
+    /// wasted disk, not a broken tile.
+    pub orphaned_files: Vec<String>,
+}
+
+/// Permanently removes assets: database rows first, then the stored files.
+///
+/// Row-then-file, deliberately. A crash between the two leaves an orphaned
+/// blob -- reclaimable disk. The reverse order would leave a row pointing at a
+/// file that no longer exists, which renders as a permanently broken tile.
+///
+/// `assets.hash` is UNIQUE, so one row owns one blob and there is no risk of
+/// unlinking a file another reference still needs.
+pub fn delete_assets(
+    lib: &Library,
+    conn: &mut Connection,
+    asset_ids: &[i64],
+) -> Result<DeleteReport> {
+    let mut report = DeleteReport::default();
+    if asset_ids.is_empty() {
+        return Ok(report);
+    }
+
+    // Collect what to unlink before the rows disappear.
+    let mut doomed: Vec<(String, String, i64)> = Vec::with_capacity(asset_ids.len());
+    {
+        let mut stmt = conn.prepare("SELECT hash, ext, bytes FROM assets WHERE id = ?1")?;
+        for id in asset_ids {
+            let mut rows = stmt.query([id])?;
+            if let Some(r) = rows.next()? {
+                doomed.push((r.get(0)?, r.get(1)?, r.get(2)?));
+            }
+        }
+    }
+
+    let tx = conn.transaction()?;
+    {
+        // Swatches and board memberships cascade from the asset row.
+        let mut stmt = tx.prepare("DELETE FROM assets WHERE id = ?1")?;
+        for id in asset_ids {
+            report.deleted += stmt.execute([id])?;
+        }
+    }
+    tx.commit()?;
+
+    for (hash, ext, bytes) in doomed {
+        let blob = lib.blob_path(&hash, &ext);
+        let thumb = lib.thumb_path(&hash);
+        let mut clean = true;
+        for path in [&blob, &thumb] {
+            if path.exists() && std::fs::remove_file(path).is_err() {
+                report.orphaned_files.push(path.display().to_string());
+                clean = false;
+            }
+        }
+        if clean {
+            report.bytes_freed += bytes;
+        }
+    }
+
+    Ok(report)
+}
+
 /// Most recently imported first.
 pub fn list_assets(
     lib: &Library,
@@ -939,6 +1008,111 @@ mod tests {
         let report = import_paths(&fx.lib, &mut fx.conn, &[fx.dir.join("src")]).expect("import");
         assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
         assert!(report.failed.is_empty(), "{:?}", report.failed);
+    }
+
+    #[test]
+    fn deleting_removes_the_row_the_blob_and_the_thumbnail() {
+        let mut fx = Fixture::new("delete");
+        let path = fx.write_png("doomed.png", 12, 12, [90, 20, 20, 255]);
+        let report = import_paths(&fx.lib, &mut fx.conn, &[path]).expect("import");
+        let asset = report.imported[0].clone();
+
+        let blob = fx.lib.blob_path(&asset.hash, "png");
+        let thumb = fx.lib.thumb_path(&asset.hash);
+        assert!(blob.exists() && thumb.exists());
+
+        let del = delete_assets(&fx.lib, &mut fx.conn, &[asset.id]).expect("delete");
+        assert_eq!(del.deleted, 1);
+        assert!(del.orphaned_files.is_empty(), "{:?}", del.orphaned_files);
+        assert!(del.bytes_freed > 0);
+
+        assert!(!blob.exists(), "blob survived deletion");
+        assert!(!thumb.exists(), "thumbnail survived deletion");
+        assert!(list_assets(&fx.lib, &fx.conn, 10, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn deleting_cascades_to_swatches_and_board_membership() {
+        let mut fx = Fixture::new("delete-cascade");
+        let path = fx.write_png("tracked.png", 10, 10, [10, 200, 10, 255]);
+        let asset = import_paths(&fx.lib, &mut fx.conn, &[path])
+            .unwrap()
+            .imported[0]
+            .clone();
+
+        let board = crate::boards::create_board(&fx.conn, "Refs").unwrap();
+        crate::boards::add_to_board(&mut fx.conn, board.id, &[asset.id]).unwrap();
+
+        delete_assets(&fx.lib, &mut fx.conn, &[asset.id]).expect("delete");
+
+        let swatches: i64 = fx
+            .conn
+            .query_row("SELECT count(*) FROM swatches", [], |r| r.get(0))
+            .unwrap();
+        let items: i64 = fx
+            .conn
+            .query_row("SELECT count(*) FROM board_items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(swatches, 0, "orphaned swatches left behind");
+        assert_eq!(items, 0, "orphaned board membership left behind");
+    }
+
+    #[test]
+    fn deleting_one_asset_leaves_the_others_intact() {
+        let mut fx = Fixture::new("delete-partial");
+        let a = fx.write_png("keep.png", 8, 8, [1, 2, 3, 255]);
+        let b = fx.write_png("drop.png", 8, 8, [200, 100, 50, 255]);
+        let imported = import_paths(&fx.lib, &mut fx.conn, &[a, b])
+            .unwrap()
+            .imported;
+
+        let keep = imported
+            .iter()
+            .find(|x| x.original_name.as_deref() == Some("keep.png"))
+            .unwrap()
+            .clone();
+        let drop = imported
+            .iter()
+            .find(|x| x.original_name.as_deref() == Some("drop.png"))
+            .unwrap()
+            .clone();
+
+        delete_assets(&fx.lib, &mut fx.conn, &[drop.id]).expect("delete");
+
+        let left = list_assets(&fx.lib, &fx.conn, 10, 0).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, keep.id);
+        assert!(
+            fx.lib.blob_path(&keep.hash, "png").exists(),
+            "deleting one asset unlinked another's blob"
+        );
+    }
+
+    #[test]
+    fn deleting_then_reimporting_the_same_file_works() {
+        let mut fx = Fixture::new("delete-reimport");
+        let path = fx.write_png("again.png", 9, 9, [30, 60, 90, 255]);
+
+        let first = import_paths(&fx.lib, &mut fx.conn, std::slice::from_ref(&path)).unwrap();
+        delete_assets(&fx.lib, &mut fx.conn, &[first.imported[0].id]).unwrap();
+
+        // The hash is free again, so this must import rather than dedupe to a
+        // row that no longer exists.
+        let second = import_paths(&fx.lib, &mut fx.conn, &[path]).unwrap();
+        assert_eq!(second.imported.len(), 1, "{:?}", second);
+        assert_eq!(second.duplicates, 0);
+        assert!(fx.lib.blob_path(&second.imported[0].hash, "png").exists());
+    }
+
+    #[test]
+    fn deleting_nothing_is_a_no_op() {
+        let mut fx = Fixture::new("delete-empty");
+        let report = delete_assets(&fx.lib, &mut fx.conn, &[]).expect("delete");
+        assert_eq!(report.deleted, 0);
+
+        // Unknown ids must not error either.
+        let missing = delete_assets(&fx.lib, &mut fx.conn, &[9999]).expect("delete");
+        assert_eq!(missing.deleted, 0);
     }
 
     #[test]

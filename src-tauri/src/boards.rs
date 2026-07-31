@@ -148,6 +148,39 @@ pub fn remove_from_board(conn: &mut Connection, board_id: i64, asset_ids: &[i64]
     Ok(removed)
 }
 
+/// Moves assets from one board to another in a single transaction.
+///
+/// Not add-then-remove from the caller: two round trips can interleave with a
+/// refresh and briefly show an asset on both boards or neither. Moving to the
+/// board an asset already sits on is a no-op rather than a delete.
+pub fn move_to_board(
+    conn: &mut Connection,
+    from_board: i64,
+    to_board: i64,
+    asset_ids: &[i64],
+) -> Result<usize> {
+    if from_board == to_board || asset_ids.is_empty() {
+        return Ok(0);
+    }
+    let added_at = now_unix();
+    let tx = conn.transaction()?;
+    let mut moved = 0usize;
+    {
+        let mut insert = tx.prepare(
+            "INSERT INTO board_items (board_id, asset_id, added_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(board_id, asset_id) DO NOTHING",
+        )?;
+        let mut delete =
+            tx.prepare("DELETE FROM board_items WHERE board_id = ?1 AND asset_id = ?2")?;
+        for id in asset_ids {
+            insert.execute(rusqlite::params![to_board, id, added_at])?;
+            moved += delete.execute(rusqlite::params![from_board, id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(moved)
+}
+
 /// Assets on a board, most recently added first.
 pub fn list_board_assets(
     lib: &Library,
@@ -360,6 +393,62 @@ mod tests {
         assert_eq!(items.len(), 2);
         // Same second-resolution timestamp, so asset_id DESC breaks the tie.
         assert_eq!(items[0].id, b);
+    }
+
+    #[test]
+    fn moving_transfers_membership_exactly_once() {
+        let mut fx = Fixture::new("move");
+        let from = create_board(&fx.conn, "From").unwrap();
+        let to = create_board(&fx.conn, "To").unwrap();
+        let a = fx.asset("moving");
+        add_to_board(&mut fx.conn, from.id, &[a]).unwrap();
+
+        assert_eq!(
+            move_to_board(&mut fx.conn, from.id, to.id, &[a]).unwrap(),
+            1
+        );
+
+        let pairs = boards_for_assets(&fx.conn, &[a]).unwrap();
+        assert_eq!(
+            pairs,
+            vec![(a, to.id)],
+            "asset should be on the target only"
+        );
+    }
+
+    #[test]
+    fn moving_onto_a_board_that_already_has_it_does_not_lose_the_asset() {
+        let mut fx = Fixture::new("move-conflict");
+        let from = create_board(&fx.conn, "From").unwrap();
+        let to = create_board(&fx.conn, "To").unwrap();
+        let a = fx.asset("both");
+        add_to_board(&mut fx.conn, from.id, &[a]).unwrap();
+        add_to_board(&mut fx.conn, to.id, &[a]).unwrap();
+
+        move_to_board(&mut fx.conn, from.id, to.id, &[a]).unwrap();
+
+        // The insert conflicts and is skipped; the delete must still leave it
+        // on the target rather than removing it from everywhere.
+        let pairs = boards_for_assets(&fx.conn, &[a]).unwrap();
+        assert_eq!(pairs, vec![(a, to.id)]);
+    }
+
+    #[test]
+    fn moving_to_the_same_board_is_a_no_op() {
+        let mut fx = Fixture::new("move-self");
+        let board = create_board(&fx.conn, "Only").unwrap();
+        let a = fx.asset("stays");
+        add_to_board(&mut fx.conn, board.id, &[a]).unwrap();
+
+        assert_eq!(
+            move_to_board(&mut fx.conn, board.id, board.id, &[a]).unwrap(),
+            0
+        );
+        // Critically, it must not have deleted the membership.
+        assert_eq!(
+            boards_for_assets(&fx.conn, &[a]).unwrap(),
+            vec![(a, board.id)]
+        );
     }
 
     #[test]

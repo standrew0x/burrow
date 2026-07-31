@@ -589,6 +589,19 @@ button:focus-visible {
   color: var(--ink-dim);
 }
 
+/* The only irreversible control in the app, so it does not look like the
+   others -- but stays quiet until hover rather than shouting from the tray. */
+.tray__delete {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--line));
+}
+
+.tray__delete:hover {
+  color: #fff;
+  background: var(--danger);
+  border-color: var(--danger);
+}
+
 /* ---------- video player ---------- */
 
 .player {

@@ -60,3 +60,10 @@ export interface Board {
   /** Thumbnail of the newest item; null for an empty board. */
   coverThumbPath: string | null;
 }
+
+export interface DeleteReport {
+  deleted: number;
+  bytesFreed: number;
+  /** Rows removed whose files could not be unlinked — wasted disk, not a broken tile. */
+  orphanedFiles: string[];
+}

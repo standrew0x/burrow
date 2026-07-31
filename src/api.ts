@@ -1,6 +1,6 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
-import type { Asset, Board, ColorMatch, ImportReport } from "./types";
+import type { Asset, Board, ColorMatch, DeleteReport, ImportReport } from "./types";
 
 export const listAssets = (limit?: number, offset?: number) =>
   invoke<Asset[]>("list_assets", { limit, offset });
@@ -55,3 +55,10 @@ export const removeFromBoard = (boardId: number, assetIds: number[]) =>
 
 export const listBoardAssets = (boardId: number, limit?: number, offset?: number) =>
   invoke<Asset[]>("list_board_assets", { boardId, limit, offset });
+
+export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number[]) =>
+  invoke<number>("move_to_board", { fromBoard, toBoard, assetIds });
+
+/** Permanent: removes the rows and unlinks the stored files. */
+export const deleteAssets = (assetIds: number[]) =>
+  invoke<DeleteReport>("delete_assets", { assetIds });

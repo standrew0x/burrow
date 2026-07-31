@@ -32,6 +32,8 @@ pub fn run() {
             commands::add_to_board,
             commands::remove_from_board,
             commands::list_board_assets,
+            commands::move_to_board,
+            commands::delete_assets,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

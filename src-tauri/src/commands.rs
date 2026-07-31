@@ -152,3 +152,24 @@ pub fn list_board_assets(
         offset.unwrap_or(0),
     )
 }
+
+#[tauri::command]
+pub fn move_to_board(
+    state: tauri::State<'_, AppState>,
+    from_board: i64,
+    to_board: i64,
+    asset_ids: Vec<i64>,
+) -> Result<usize> {
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    crate::boards::move_to_board(&mut conn, from_board, to_board, &asset_ids)
+}
+
+/// Permanently deletes references and their stored files.
+#[tauri::command]
+pub fn delete_assets(
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<crate::ingest::DeleteReport> {
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::delete_assets(&state.library, &mut conn, &asset_ids)
+}
