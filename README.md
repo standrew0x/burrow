@@ -84,16 +84,19 @@ git tag v0.1.0 && git push origin v0.1.0
 ```
 
 `release.yml` builds on `windows-latest`, fetches models, bundles NSIS + MSI,
-and opens a **draft** GitHub Release. Smoke-test the installer, then publish —
-publishing is what exposes the new version to every user's auto-updater.
+and opens a **draft** GitHub Release. Smoke-test the installer, then publish.
+
+Both bundle targets are confirmed to build locally:
+`Burrow_0.1.0_x64-setup.exe` (3.5 MB) and `Burrow_0.1.0_x64_en-US.msi` (5 MB).
 
 ### Before the first real release
 
-1. **Updater keys.** `npm run tauri signer generate -- -w tauri-updater.key`.
-   Private key → repo secret `TAURI_SIGNING_PRIVATE_KEY`. Public key →
-   `plugins.updater.pubkey` in `tauri.conf.json`. The private key must never
-   land on disk in this repo; a leak lets anyone push a signed update to every
-   install.
+1. **Auto-updates are off,** deliberately. There is no updater plugin and
+   `createUpdaterArtifacts` is unset, so no `.sig` files are produced and
+   `includeUpdaterJson` stays commented out in the workflow — asking for an
+   updater manifest without those makes `tauri-action` hunt for signatures that
+   never existed. Turning updates on means doing all four steps listed in
+   `release.yml`; any one alone is a no-op or a failed release.
 
 2. **Code signing.** Unsigned installers hit a SmartScreen wall that kills
    conversion. Since 2023 OV certs require an HSM, so realistically that means

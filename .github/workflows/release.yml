@@ -106,15 +106,30 @@ jobs:
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Updater signing keys. Generate once with:
-          #   npm run tauri signer generate -- -w tauri-updater.key
-          # Put the PRIVATE key in the TAURI_SIGNING_PRIVATE_KEY secret and the
-          # PUBLIC key in tauri.conf.json under plugins.updater.pubkey.
-          # If the private key leaks, anyone can push a signed update to every
-          # install. It never touches disk in this repo.
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-          # Uncomment alongside the signing steps above:
+          # -----------------------------------------------------------------
+          # AUTO-UPDATES ARE OFF
+          # -----------------------------------------------------------------
+          # There is no updater plugin and tauri.conf.json does not set
+          # createUpdaterArtifacts, so the build emits no .sig files. Asking
+          # tauri-action for an updater manifest in that state makes it hunt
+          # for signatures that were never produced.
+          #
+          # TO TURN THEM ON, all four together -- any one alone is a no-op or a
+          # failed release:
+          #   1. cargo add tauri-plugin-updater, register it in lib.rs
+          #   2. tauri.conf.json -> "bundle": { "createUpdaterArtifacts": true }
+          #   3. npm run tauri signer generate -- -w tauri-updater.key
+          #      private key -> TAURI_SIGNING_PRIVATE_KEY repo secret
+          #      public  key -> plugins.updater.pubkey in tauri.conf.json
+          #   4. uncomment the two env vars below and includeUpdaterJson in `with`
+          #
+          # The private key must never land on disk in this repo. A leak lets
+          # anyone push a signed update to every install.
+          #
+          # TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          # TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          #
+          # Uncomment alongside the code-signing steps above:
           # AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           # AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           # AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
@@ -123,10 +138,10 @@ jobs:
           releaseName: 'Burrow ${{ github.ref_name }}'
           releaseBody: 'See the assets below to download and install.'
           # Publish as a draft so you can smoke-test the installer before
-          # anyone's auto-updater sees it. Flip to false once you trust it.
+          # anyone downloads it. Flip to false once you trust the pipeline.
           releaseDraft: true
           prerelease: false
-          includeUpdaterJson: true
+          # includeUpdaterJson: true   # see the AUTO-UPDATES note above
           args: --target x86_64-pc-windows-msvc
 
       # Always keep the raw bundles, even on a dry run where no Release exists.
