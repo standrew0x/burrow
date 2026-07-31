@@ -79,6 +79,64 @@ struct Prepared {
     swatches: Vec<Swatch>,
 }
 
+/// Extensions collected when walking a dropped directory.
+///
+/// Files named explicitly are always attempted regardless of extension --
+/// `format_of` sniffs the real type from content. This list only gates
+/// *discovered* files, so dropping a project folder does not turn its .txt,
+/// .psd and .ai files into a wall of failures the user has to scroll past.
+const WALK_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "avif", "bmp", "tif", "tiff", "ico",
+];
+
+/// Recursion cap for directory walks. Windows makes junctions and symlinks
+/// easy to create by accident, and `read_dir` follows them happily -- without
+/// a cap a cyclic junction is an infinite walk.
+const MAX_WALK_DEPTH: usize = 8;
+
+fn has_image_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .is_some_and(|e| WALK_EXTENSIONS.contains(&e.as_str()))
+}
+
+fn walk_into(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth >= MAX_WALK_DEPTH {
+        return;
+    }
+    // An unreadable directory is skipped rather than failing the batch: a drop
+    // of ten folders should not be lost because one of them is permission-denied.
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_into(&path, depth + 1, out);
+        } else if has_image_extension(&path) {
+            out.push(path);
+        }
+    }
+}
+
+/// Expands any directories in `paths` into the image files beneath them.
+///
+/// The OS hands over exactly what was dragged -- drop a folder and you get one
+/// path, the folder itself. Without this, `fs::read` on that path fails and the
+/// user sees "Access is denied" instead of an import.
+fn expand_inputs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(paths.len());
+    for path in paths {
+        if path.is_dir() {
+            walk_into(path, 0, &mut out);
+        } else {
+            out.push(path.clone());
+        }
+    }
+    out
+}
+
 fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,6 +157,9 @@ pub fn import_paths(
     paths: &[PathBuf],
 ) -> Result<ImportReport> {
     let mut report = ImportReport::default();
+
+    // Dropped folders arrive as a single path; expand before anything else.
+    let paths = expand_inputs(paths);
     if paths.is_empty() {
         return Ok(report);
     }
@@ -528,6 +589,75 @@ mod tests {
             .failed
             .iter()
             .any(|f| f.path.contains("does-not-exist.png")));
+    }
+
+    #[test]
+    fn dropping_a_folder_imports_the_images_inside_it() {
+        let mut fx = Fixture::new("folder-drop");
+        fx.write_png("a.png", 8, 8, [255, 0, 0, 255]);
+        fx.write_png("b.png", 8, 8, [0, 255, 0, 255]);
+
+        // The OS hands over the folder itself, not its contents.
+        let folder = fx.dir.join("src");
+        let report = import_paths(&fx.lib, &mut fx.conn, &[folder]).expect("import");
+
+        assert_eq!(report.imported.len(), 2, "{:?}", report.failed);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
+    }
+
+    #[test]
+    fn folder_walk_recurses_and_ignores_non_images() {
+        let mut fx = Fixture::new("folder-walk");
+        fx.write_png("top.png", 8, 8, [1, 1, 1, 255]);
+
+        let nested = fx.dir.join("src").join("deep").join("deeper");
+        std::fs::create_dir_all(&nested).unwrap();
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(8, 8, Rgba([9, 9, 9, 255])));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image.write_to(&mut buf, image::ImageFormat::Png).unwrap();
+        std::fs::write(nested.join("buried.png"), buf.into_inner()).unwrap();
+
+        // Non-images in a walked folder are skipped silently, not reported as
+        // failures -- otherwise dropping a project folder buries the result.
+        std::fs::write(fx.dir.join("src").join("notes.txt"), b"not an image").unwrap();
+        std::fs::write(fx.dir.join("src").join("layers.psd"), b"nope").unwrap();
+
+        let report = import_paths(&fx.lib, &mut fx.conn, &[fx.dir.join("src")]).expect("import");
+
+        assert_eq!(
+            report.imported.len(),
+            2,
+            "should find top.png and buried.png"
+        );
+        assert!(
+            report.failed.is_empty(),
+            "non-images in a walked folder must not surface as failures: {:?}",
+            report.failed
+        );
+    }
+
+    #[test]
+    fn an_explicit_non_image_file_still_reports_a_failure() {
+        let mut fx = Fixture::new("explicit-non-image");
+        let junk = fx.dir.join("src").join("notes.txt");
+        std::fs::write(&junk, b"not an image").unwrap();
+
+        // Extension filtering applies only to files *discovered* in a folder.
+        // Something the user pointed at directly deserves an explanation.
+        let report = import_paths(&fx.lib, &mut fx.conn, &[junk]).expect("import");
+        assert_eq!(report.imported.len(), 0);
+        assert_eq!(report.failed.len(), 1, "{:?}", report.failed);
+    }
+
+    #[test]
+    fn an_empty_folder_is_a_no_op() {
+        let mut fx = Fixture::new("empty-folder");
+        let empty = fx.dir.join("nothing");
+        std::fs::create_dir_all(&empty).unwrap();
+
+        let report = import_paths(&fx.lib, &mut fx.conn, &[empty]).expect("import");
+        assert_eq!(report.imported.len(), 0);
+        assert!(report.failed.is_empty(), "{:?}", report.failed);
     }
 
     #[test]
