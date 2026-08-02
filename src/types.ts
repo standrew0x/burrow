@@ -67,3 +67,13 @@ export interface DeleteReport {
   /** Rows removed whose files could not be unlinked — wasted disk, not a broken tile. */
   orphanedFiles: string[];
 }
+
+export interface SyncReport {
+  folder: string;
+  /** Videos the folder offered, before the limit was applied. */
+  available: number;
+  downloaded: number;
+  imported: number;
+  duplicates: number;
+  failed: FailedImport[];
+}

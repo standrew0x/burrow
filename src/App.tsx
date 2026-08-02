@@ -18,6 +18,7 @@ import {
   removeFromBoard,
   renameBoard,
   searchByColor,
+  syncFromX,
   thumbUrl,
 } from "./api";
 import type { Asset, Board, FailedImport } from "./types";
@@ -29,7 +30,18 @@ interface Notice {
   failed: FailedImport[];
   deleted?: number;
   bytesFreed?: number;
+  /** Present when the notice came from an X sync rather than a drop. */
+  syncedFrom?: string;
 }
+
+/** Batch sizes offered next to the Sync button.
+ *
+ *  Measured at roughly 26s per video end to end (download plus poster-frame
+ *  extraction), so 50 would block the window for ~20 minutes. The source folder
+ *  holds ~500 videos at ~2.3GB; syncing is deliberately a slice you choose,
+ *  not an all-or-nothing operation. */
+const SYNC_BATCH_OPTIONS = [5, 10, 25, 50] as const;
+const DEFAULT_SYNC_BATCH = 10;
 
 /** OkLab search radius. See DEFAULT_COLOR_TOLERANCE in commands.rs for how
  *  this number was picked; keep the two in step. */
@@ -66,6 +78,8 @@ export default function App() {
   const [root, setRoot] = useState("");
   const [playing, setPlaying] = useState<Asset | null>(null);
   const [playbackFailed, setPlaybackFailed] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const [syncBatch, setSyncBatch] = useState<number>(DEFAULT_SYNC_BATCH);
 
   /** null = the whole library. */
   const [activeBoardId, setActiveBoardId] = useState<number | null>(null);
@@ -189,6 +203,31 @@ export default function App() {
     setColorFilter(null);
     setHexInput("");
     clearSelection();
+  };
+
+  const runSync = async () => {
+    setSyncing(true);
+    setNotice(null);
+    setError(null);
+    try {
+      const report = await syncFromX(syncBatch);
+      // A sync always lands in the library, so show it there rather than
+      // leaving the user on a board that did not change.
+      setActiveBoardId(null);
+      setColorFilter(null);
+      setNotice({
+        imported: report.imported,
+        duplicates: report.duplicates,
+        failed: report.failed,
+        syncedFrom: `${report.folder} · ${report.available} available`,
+      });
+      await refresh();
+      await refreshBoards();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSyncing(false);
+    }
   };
 
   const submitHex = (e: React.FormEvent) => {
@@ -376,6 +415,32 @@ export default function App() {
             <span className="bar__count">{heading}</span>
           </div>
 
+          <div className="bar__actions">
+            <select
+              className="bar__batch"
+              value={syncBatch}
+              onChange={(e) => setSyncBatch(Number(e.target.value))}
+              disabled={syncing}
+              aria-label="How many videos to sync"
+              title="Roughly 26 seconds per video"
+            >
+              {SYNC_BATCH_OPTIONS.map((n) => (
+                <option key={n} value={n}>
+                  {n}
+                </option>
+              ))}
+            </select>
+            <button
+              type="button"
+              className="bar__sync"
+              onClick={() => void runSync()}
+              disabled={syncing || importingCount !== null}
+              title={`Pull the newest ${syncBatch} bookmarked videos from X (~${Math.round((syncBatch * 26) / 60)} min)`}
+            >
+              {syncing ? `Syncing ${syncBatch}…` : "Sync from X"}
+            </button>
+          </div>
+
           <form className="bar__search" onSubmit={submitHex}>
             <input
               type="text"
@@ -427,6 +492,7 @@ export default function App() {
               <>
                 <strong>{notice.imported}</strong> imported
                 {notice.duplicates > 0 && <> · {notice.duplicates} already in library</>}
+                {notice.syncedFrom && <> · from {notice.syncedFrom}</>}
               </>
             )}
             {notice.failed.length > 0 && <> · {notice.failed.length} failed</>}
@@ -450,7 +516,7 @@ export default function App() {
           </div>
         )}
 
-        {importingCount !== null && <div className="progress" />}
+        {(importingCount !== null || syncing) && <div className="progress" />}
 
         {!loading && assets.length === 0 ? (
           <div className="empty">

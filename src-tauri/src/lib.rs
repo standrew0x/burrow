@@ -7,6 +7,7 @@ pub mod image_ops;
 pub mod ingest;
 pub mod store;
 pub mod video;
+pub mod xsync;
 
 use commands::AppState;
 use store::Library;
@@ -34,6 +35,7 @@ pub fn run() {
             commands::list_board_assets,
             commands::move_to_board,
             commands::delete_assets,
+            commands::sync_from_x,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

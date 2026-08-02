@@ -216,6 +216,44 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.bar__actions {
+  display: flex;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.bar__batch {
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.bar__sync {
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.bar__sync:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.bar__sync:disabled {
+  color: var(--ink-dim);
+  cursor: default;
+}
+
 .bar__search {
   display: flex;
   gap: 8px;

@@ -1,6 +1,13 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 
-import type { Asset, Board, ColorMatch, DeleteReport, ImportReport } from "./types";
+import type {
+  Asset,
+  Board,
+  ColorMatch,
+  DeleteReport,
+  ImportReport,
+  SyncReport,
+} from "./types";
 
 export const listAssets = (limit?: number, offset?: number) =>
   invoke<Asset[]>("list_assets", { limit, offset });
@@ -62,3 +69,6 @@ export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number
 /** Permanent: removes the rows and unlinks the stored files. */
 export const deleteAssets = (assetIds: number[]) =>
   invoke<DeleteReport>("delete_assets", { assetIds });
+
+/** Pulls the newest videos from the configured X bookmark folder. */
+export const syncFromX = (limit?: number) => invoke<SyncReport>("sync_from_x", { limit });

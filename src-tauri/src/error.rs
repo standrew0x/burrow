@@ -28,6 +28,9 @@ pub enum Error {
     #[error("{0}")]
     Ffmpeg(String),
 
+    #[error("{0}")]
+    X(String),
+
     #[error("no library directory available on this platform")]
     NoLibraryDir,
 
