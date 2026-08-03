@@ -2,11 +2,15 @@
 //!
 //! Shelling out rather than linking `ffmpeg-next`: the C bindings are a
 //! miserable build on Windows/MSVC, and a process boundary keeps ffmpeg's
-//! licence from reaching into this binary. The cost is that ffmpeg must be on
-//! PATH, which is checked with a clear error rather than a mystery failure.
+//! licence from reaching into this binary. That separation is what makes it
+//! legitimate to ship an LGPL ffmpeg alongside the app.
+//!
+//! The shipped build lives in the bundle's resources and is preferred; a copy
+//! on PATH is the fallback, which is what the CLI examples and `tauri dev` use.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 
 use serde::Deserialize;
 
@@ -66,22 +70,46 @@ struct ProbeFormat {
     duration: Option<String>,
 }
 
-fn tool_missing(tool: &str, e: &std::io::Error) -> Error {
+/// Directory holding the bundled ffmpeg, set once at startup.
+static BUNDLED_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Points the module at the bundled ffmpeg. Called once from `run()` with the
+/// resolved resource directory; later calls are ignored.
+pub fn use_bundled_dir(dir: PathBuf) {
+    let _ = BUNDLED_DIR.set(dir);
+}
+
+/// Absolute path to the bundled tool, or the bare name so the OS searches PATH.
+///
+/// Existence is checked rather than assumed: a dev build has no resource
+/// directory, and handing back a path that is not there would turn a perfectly
+/// good PATH install into a confusing "not found".
+fn tool(name: &str) -> PathBuf {
+    if let Some(dir) = BUNDLED_DIR.get() {
+        let exe = dir.join(format!("{name}.exe"));
+        if exe.is_file() {
+            return exe;
+        }
+    }
+    PathBuf::from(name)
+}
+
+fn tool_missing(name: &str, e: &std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::NotFound {
         Error::Ffmpeg(format!(
-            "{tool} was not found on PATH. Install it (winget install Gyan.FFmpeg) \
-             to import video."
+            "{name} could not be found. It ships with Burrow, so this usually means \
+             the install is incomplete -- reinstall, or put {name} on PATH."
         ))
     } else {
-        Error::Ffmpeg(format!("could not run {tool}: {e}"))
+        Error::Ffmpeg(format!("could not run {name}: {e}"))
     }
 }
 
 /// True when both tools can be executed. Used to give one clear message up
 /// front instead of one failure per dropped file.
 pub fn tooling_available() -> bool {
-    ["ffprobe", "ffmpeg"].iter().all(|tool| {
-        Command::new(tool)
+    ["ffprobe", "ffmpeg"].iter().all(|name| {
+        Command::new(tool(name))
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -93,7 +121,7 @@ pub fn tooling_available() -> bool {
 /// Reads stream metadata. `Ok(None)` means the file has no video stream --
 /// an audio file, or something ffprobe understands but we do not want.
 pub fn probe(path: &Path) -> Result<Option<VideoInfo>> {
-    let output = Command::new("ffprobe")
+    let output = Command::new(tool("ffprobe"))
         .args([
             "-v",
             "error",
@@ -167,7 +195,7 @@ pub fn poster_offset_seconds(duration_ms: i64) -> f64 {
 pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
     let offset = poster_offset_seconds(duration_ms);
 
-    let output = Command::new("ffmpeg")
+    let output = Command::new(tool("ffmpeg"))
         .args(["-v", "error"])
         // -ss BEFORE -i is the fast path: ffmpeg seeks the container instead of
         // decoding every frame up to the offset. On a long video that is the

@@ -344,3 +344,109 @@ pub async fn x_folders(state: tauri::State<'_, AppState>) -> Result<Vec<String>>
     .await
     .map_err(|e| Error::X(format!("folder lookup panicked: {e}")))?
 }
+
+/// Whether a stored X session exists and still works.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct XStatus {
+    pub connected: bool,
+    pub has_session: bool,
+    /// Human-readable reason when `connected` is false.
+    pub detail: String,
+}
+
+/// Saves pasted cookies, then immediately proves they work.
+///
+/// Verifying here rather than on the next sync means a bad paste is caught
+/// while the user is still looking at the field they pasted into.
+#[tauri::command]
+pub async fn save_x_session(
+    state: tauri::State<'_, AppState>,
+    auth_token: String,
+    ct0: String,
+) -> Result<XStatus> {
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || -> Result<XStatus> {
+        let lib = crate::store::Library::open(&library_root)?;
+        crate::xsync::XSession::save(&lib, &auth_token, &ct0)?;
+        Ok(check_session(&lib))
+    })
+    .await
+    .map_err(|e| Error::X(format!("save task panicked: {e}")))?
+}
+
+#[tauri::command]
+pub async fn x_status(state: tauri::State<'_, AppState>) -> Result<XStatus> {
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || -> Result<XStatus> {
+        let lib = crate::store::Library::open(&library_root)?;
+        Ok(check_session(&lib))
+    })
+    .await
+    .map_err(|e| Error::X(format!("status task panicked: {e}")))?
+}
+
+#[tauri::command]
+pub async fn clear_x_session(state: tauri::State<'_, AppState>) -> Result<XStatus> {
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || -> Result<XStatus> {
+        let lib = crate::store::Library::open(&library_root)?;
+        crate::xsync::XSession::clear(&lib)?;
+        Ok(check_session(&lib))
+    })
+    .await
+    .map_err(|e| Error::X(format!("clear task panicked: {e}")))?
+}
+
+/// One authenticated call, so "connected" means it actually works rather than
+/// "a file exists".
+fn check_session(lib: &crate::store::Library) -> XStatus {
+    let session = match crate::xsync::XSession::load(lib) {
+        Ok(s) => s,
+        Err(e) => {
+            return XStatus {
+                connected: false,
+                has_session: false,
+                detail: e.to_string(),
+            }
+        }
+    };
+    let client = match crate::xsync::XClient::new(session) {
+        Ok(c) => c,
+        Err(e) => {
+            return XStatus {
+                connected: false,
+                has_session: true,
+                detail: e.to_string(),
+            }
+        }
+    };
+    // Probe with the same operation a default sync uses, NOT the folder list.
+    // Bookmark folders are a Premium feature and can return "User is not
+    // authorized to use bookmark collections" on an account whose plain
+    // bookmarks read perfectly well -- reporting that as "not connected" would
+    // disable syncing over a capability syncing does not need.
+    let probe = client.discover(&["Bookmarks"]).and_then(|specs| {
+        client.fetch_bookmarks(
+            &specs[0],
+            &crate::xsync::BookmarkSource::All,
+            &crate::xsync::FetchOptions {
+                limit: 1,
+                ..Default::default()
+            },
+        )
+    });
+
+    match probe {
+        Ok(_) => XStatus {
+            connected: true,
+            has_session: true,
+            detail: "signed in, bookmarks readable".to_string(),
+        },
+        Err(e) => XStatus {
+            connected: false,
+            has_session: true,
+            detail: e.to_string(),
+        },
+    }
+}

@@ -116,6 +116,36 @@ impl XSession {
         }
         Ok(session)
     }
+
+    /// Writes the session to the library root.
+    ///
+    /// Values are trimmed because pasting from DevTools routinely drags along
+    /// whitespace, and a stray space turns a valid token into a 401 that looks
+    /// exactly like an expired login.
+    pub fn save(lib: &Library, auth_token: &str, ct0: &str) -> Result<()> {
+        let auth_token = auth_token.trim();
+        let ct0 = ct0.trim();
+        if auth_token.is_empty() || ct0.is_empty() {
+            return Err(Error::X("both auth_token and ct0 are required".into()));
+        }
+        let path = Self::path(lib);
+        let body = serde_json::json!({ "auth_token": auth_token, "ct0": ct0 });
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&body).unwrap_or_default(),
+        )
+        .map_err(|e| Error::io(&path, e))?;
+        Ok(())
+    }
+
+    /// Removes the stored session.
+    pub fn clear(lib: &Library) -> Result<()> {
+        let path = Self::path(lib);
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| Error::io(&path, e))?;
+        }
+        Ok(())
+    }
 }
 
 // --- client ---

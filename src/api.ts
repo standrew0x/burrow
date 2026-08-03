@@ -8,6 +8,7 @@ import type {
   ImportReport,
   SyncOptions,
   SyncReport,
+  XStatus,
 } from "./types";
 
 export const listAssets = (limit?: number, offset?: number) =>
@@ -79,3 +80,11 @@ export const syncFromX = (opts: SyncOptions) =>
 
 /** Bookmark folder names, so the UI can offer them rather than hardcode one. */
 export const xFolders = () => invoke<string[]>("x_folders");
+
+export const xStatus = () => invoke<XStatus>("x_status");
+
+/** Stores the cookies and immediately verifies them against X. */
+export const saveXSession = (authToken: string, ct0: string) =>
+  invoke<XStatus>("save_x_session", { authToken, ct0 });
+
+export const clearXSession = () => invoke<XStatus>("clear_x_session");

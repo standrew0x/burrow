@@ -20,9 +20,12 @@ import {
   searchByColor,
   syncFromX,
   thumbUrl,
+  clearXSession,
+  saveXSession,
   xFolders,
+  xStatus,
 } from "./api";
-import type { Asset, Board, FailedImport, SyncKinds } from "./types";
+import type { Asset, Board, FailedImport, SyncKinds, XStatus } from "./types";
 import "./App.css";
 
 interface Notice {
@@ -91,6 +94,12 @@ export default function App() {
   const [syncTo, setSyncTo] = useState("");
   const [folders, setFolders] = useState<string[]>([]);
   const [foldersLoading, setFoldersLoading] = useState(false);
+  const [foldersError, setFoldersError] = useState<string | null>(null);
+  const [connectOpen, setConnectOpen] = useState(false);
+  const [xState, setXState] = useState<XStatus | null>(null);
+  const [xChecking, setXChecking] = useState(false);
+  const [authTokenInput, setAuthTokenInput] = useState("");
+  const [ct0Input, setCt0Input] = useState("");
 
   /** null = the whole library. */
   const [activeBoardId, setActiveBoardId] = useState<number | null>(null);
@@ -136,7 +145,43 @@ export default function App() {
     libraryRoot()
       .then(setRoot)
       .catch(() => {});
+    // One authenticated call at startup so the Sync button can say whether it
+    // will actually work before the user presses it.
+    setXChecking(true);
+    xStatus()
+      .then(setXState)
+      .catch(() => {})
+      .finally(() => setXChecking(false));
   }, [refreshBoards]);
+
+  const connectX = async () => {
+    setXChecking(true);
+    setError(null);
+    try {
+      const status = await saveXSession(authTokenInput, ct0Input);
+      setXState(status);
+      if (status.connected) {
+        // Only clear the fields on success; keeping them on failure lets the
+        // user fix one value rather than re-paste both.
+        setAuthTokenInput("");
+        setCt0Input("");
+        setConnectOpen(false);
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setXChecking(false);
+    }
+  };
+
+  const disconnectX = async () => {
+    try {
+      setXState(await clearXSession());
+      setFolders([]);
+    } catch (e) {
+      setError(String(e));
+    }
+  };
 
   const runImport = useCallback(
     async (paths: string[]) => {
@@ -436,9 +481,31 @@ export default function App() {
           </div>
 
           <div className="bar__actions">
+            <span
+              className={`bar__xdot${xState?.connected ? " bar__xdot--on" : ""}`}
+              title={
+                xChecking
+                  ? "Checking X connection…"
+                  : (xState?.detail ?? "Not connected to X")
+              }
+              aria-hidden="true"
+            />
             <button
               type="button"
               className="bar__sync"
+              onClick={() => setConnectOpen((v) => !v)}
+            >
+              {xState?.connected ? "X connected" : "Connect X"}
+            </button>
+            <button
+              type="button"
+              className="bar__sync"
+              disabled={syncing || !xState?.connected}
+              title={
+                xState?.connected
+                  ? "Choose what to pull from your bookmarks"
+                  : "Connect your X account first"
+              }
               onClick={() => {
                 const next = !syncOpen;
                 setSyncOpen(next);
@@ -446,13 +513,13 @@ export default function App() {
                 // the panel is actually opened.
                 if (next && folders.length === 0 && !foldersLoading) {
                   setFoldersLoading(true);
+                  setFoldersError(null);
                   xFolders()
                     .then(setFolders)
-                    .catch(() => {})
+                    .catch((e) => setFoldersError(String(e)))
                     .finally(() => setFoldersLoading(false));
                 }
               }}
-              disabled={syncing}
               aria-expanded={syncOpen}
             >
               {syncing ? `Syncing ${syncBatch}…` : "Sync from X"}
@@ -483,6 +550,78 @@ export default function App() {
             )}
           </form>
         </header>
+
+        {connectOpen && (
+          <div className="connect">
+            <div className="connect__head">
+              <strong>Connect your X account</strong>
+              <span
+                className={xState?.connected ? "connect__ok" : "connect__bad"}
+              >
+                {xChecking
+                  ? "checking…"
+                  : xState?.connected
+                    ? `connected — ${xState.detail}`
+                    : (xState?.detail ?? "not connected")}
+              </span>
+            </div>
+
+            <ol className="connect__steps">
+              <li>Open <code>x.com</code> in your browser, signed in.</li>
+              <li>Press <kbd>F12</kbd>, then open the <b>Application</b> tab.</li>
+              <li>In the sidebar choose <b>Cookies &rarr; https://x.com</b>.</li>
+              <li>
+                Find <code>auth_token</code> and <code>ct0</code> and copy each
+                value into the boxes below.
+              </li>
+            </ol>
+
+            <div className="connect__fields">
+              <label>
+                <span>auth_token</span>
+                <input
+                  type="password"
+                  value={authTokenInput}
+                  onChange={(e) => setAuthTokenInput(e.target.value)}
+                  placeholder="40 characters"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+              <label>
+                <span>ct0</span>
+                <input
+                  type="password"
+                  value={ct0Input}
+                  onChange={(e) => setCt0Input(e.target.value)}
+                  placeholder="160 characters"
+                  spellCheck={false}
+                  autoComplete="off"
+                />
+              </label>
+              <button
+                type="button"
+                className="sync__go"
+                onClick={() => void connectX()}
+                disabled={xChecking || !authTokenInput.trim() || !ct0Input.trim()}
+              >
+                {xChecking ? "Checking…" : "Connect"}
+              </button>
+              {xState?.hasSession && (
+                <button type="button" onClick={() => void disconnectX()}>
+                  Disconnect
+                </button>
+              )}
+            </div>
+
+            <p className="connect__note">
+              These are stored only on this PC, in your library folder, and are
+              sent nowhere except x.com. They are as powerful as your password,
+              so do not share them. X expires them every few weeks &mdash; when
+              Sync starts failing, paste fresh ones here.
+            </p>
+          </div>
+        )}
 
         {syncOpen && (
           <div className="sync">
@@ -539,6 +678,14 @@ export default function App() {
               Videos take roughly 26s each; images are near-instant. Dates are
               when the post was made, not when you bookmarked it.
               {foldersLoading && " Loading folders…"}
+              {foldersError && (
+                <>
+                  {" "}
+                  Folder list unavailable, so only <b>All bookmarks</b> is
+                  offered — bookmark folders are an X Premium feature. Syncing
+                  everything still works.
+                </>
+              )}
             </p>
           </div>
         )}

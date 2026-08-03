@@ -798,3 +798,118 @@ button:focus-visible {
   border: 2px dashed var(--accent);
   border-radius: 10px;
 }
+
+/* ---------- X connection ---------- */
+
+/* A quiet status light next to the button: green when a real authenticated
+   call succeeded, not merely when a session file exists. */
+.bar__xdot {
+  width: 7px;
+  height: 7px;
+  background: var(--ink-dim);
+  border-radius: 50%;
+  opacity: 0.5;
+}
+
+.bar__xdot--on {
+  background: #3fb950;
+  opacity: 1;
+}
+
+.connect {
+  padding: 16px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.connect__head {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+  margin-bottom: 10px;
+}
+
+.connect__ok {
+  color: #3fb950;
+  font-size: 12px;
+}
+
+.connect__bad {
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.connect__steps {
+  margin: 0 0 12px;
+  padding-left: 20px;
+  color: var(--ink-dim);
+  font-size: 12.5px;
+  line-height: 1.7;
+}
+
+.connect__steps code,
+.connect__note code {
+  padding: 1px 4px;
+  font-size: 11.5px;
+  background: var(--surface-2);
+  border-radius: 3px;
+}
+
+.connect__steps kbd {
+  padding: 1px 5px;
+  font-size: 11px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
+
+.connect__fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  align-items: flex-end;
+}
+
+.connect__fields label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.connect__fields label span {
+  color: var(--ink-dim);
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+
+/* type=password so the values are not readable over a shoulder or in a
+   screen share while being pasted. */
+.connect__fields input {
+  width: 240px;
+  padding: 6px 9px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.connect__fields button:not(.sync__go) {
+  padding: 7px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink-dim);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.connect__note {
+  max-width: 70ch;
+  margin: 12px 0 0;
+  color: var(--ink-dim);
+  font-size: 11.5px;
+  line-height: 1.6;
+}

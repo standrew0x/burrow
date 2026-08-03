@@ -20,6 +20,19 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .setup(|app| {
+            // Prefer the ffmpeg shipped in the bundle so video import works on
+            // a machine that has never heard of ffmpeg. Falls back to PATH,
+            // which is what `tauri dev` and the CLI examples use.
+            use tauri::Manager;
+            if let Ok(dir) = app
+                .path()
+                .resolve("ffmpeg", tauri::path::BaseDirectory::Resource)
+            {
+                crate::video::use_bundled_dir(dir);
+            }
+            Ok(())
+        })
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::import_paths,
@@ -37,6 +50,9 @@ pub fn run() {
             commands::delete_assets,
             commands::sync_from_x,
             commands::x_folders,
+            commands::x_status,
+            commands::save_x_session,
+            commands::clear_x_session,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -92,3 +92,10 @@ export interface SyncReport {
   videos: number;
   failed: FailedImport[];
 }
+
+export interface XStatus {
+  connected: boolean;
+  hasSession: boolean;
+  /** Why, when not connected. */
+  detail: string;
+}

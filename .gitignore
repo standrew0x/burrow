@@ -48,6 +48,13 @@ models/
 *.bin
 
 # ---------------------------------------------------------------------------
+# Bundled ffmpeg -- NEVER COMMIT
+# ---------------------------------------------------------------------------
+# ~129MB of LGPL binaries fetched by scripts/fetch-ffmpeg.ps1. Same reasoning
+# as the model weights: git keeps every revision forever.
+vendor/
+
+# ---------------------------------------------------------------------------
 # Local dev library / user data
 # ---------------------------------------------------------------------------
 # The app hoards images for a living. One careless `git add -A` over a dev
