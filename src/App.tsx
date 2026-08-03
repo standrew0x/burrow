@@ -20,8 +20,9 @@ import {
   searchByColor,
   syncFromX,
   thumbUrl,
+  xFolders,
 } from "./api";
-import type { Asset, Board, FailedImport } from "./types";
+import type { Asset, Board, FailedImport, SyncKinds } from "./types";
 import "./App.css";
 
 interface Notice {
@@ -32,6 +33,8 @@ interface Notice {
   bytesFreed?: number;
   /** Present when the notice came from an X sync rather than a drop. */
   syncedFrom?: string;
+  images?: number;
+  videos?: number;
 }
 
 /** Batch sizes offered next to the Sync button.
@@ -40,7 +43,7 @@ interface Notice {
  *  extraction), so 50 would block the window for ~20 minutes. The source folder
  *  holds ~500 videos at ~2.3GB; syncing is deliberately a slice you choose,
  *  not an all-or-nothing operation. */
-const SYNC_BATCH_OPTIONS = [5, 10, 25, 50] as const;
+const SYNC_BATCH_OPTIONS = [5, 10, 25, 50, 100] as const;
 const DEFAULT_SYNC_BATCH = 10;
 
 /** OkLab search radius. See DEFAULT_COLOR_TOLERANCE in commands.rs for how
@@ -80,6 +83,14 @@ export default function App() {
   const [playbackFailed, setPlaybackFailed] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [syncBatch, setSyncBatch] = useState<number>(DEFAULT_SYNC_BATCH);
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [syncKinds, setSyncKinds] = useState<SyncKinds>("all");
+  /** "" means every bookmark, not a folder. */
+  const [syncFolder, setSyncFolder] = useState("");
+  const [syncFrom, setSyncFrom] = useState("");
+  const [syncTo, setSyncTo] = useState("");
+  const [folders, setFolders] = useState<string[]>([]);
+  const [foldersLoading, setFoldersLoading] = useState(false);
 
   /** null = the whole library. */
   const [activeBoardId, setActiveBoardId] = useState<number | null>(null);
@@ -210,7 +221,13 @@ export default function App() {
     setNotice(null);
     setError(null);
     try {
-      const report = await syncFromX(syncBatch);
+      const report = await syncFromX({
+        limit: syncBatch,
+        folder: syncFolder || undefined,
+        from: syncFrom || undefined,
+        to: syncTo || undefined,
+        kinds: syncKinds,
+      });
       // A sync always lands in the library, so show it there rather than
       // leaving the user on a board that did not change.
       setActiveBoardId(null);
@@ -219,8 +236,11 @@ export default function App() {
         imported: report.imported,
         duplicates: report.duplicates,
         failed: report.failed,
-        syncedFrom: `${report.folder} · ${report.available} available`,
+        syncedFrom: `${report.source} · ${report.found} found`,
+        images: report.images,
+        videos: report.videos,
       });
+      setSyncOpen(false);
       await refresh();
       await refreshBoards();
     } catch (e) {
@@ -416,26 +436,24 @@ export default function App() {
           </div>
 
           <div className="bar__actions">
-            <select
-              className="bar__batch"
-              value={syncBatch}
-              onChange={(e) => setSyncBatch(Number(e.target.value))}
-              disabled={syncing}
-              aria-label="How many videos to sync"
-              title="Roughly 26 seconds per video"
-            >
-              {SYNC_BATCH_OPTIONS.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
             <button
               type="button"
               className="bar__sync"
-              onClick={() => void runSync()}
-              disabled={syncing || importingCount !== null}
-              title={`Pull the newest ${syncBatch} bookmarked videos from X (~${Math.round((syncBatch * 26) / 60)} min)`}
+              onClick={() => {
+                const next = !syncOpen;
+                setSyncOpen(next);
+                // Folder names cost a round trip to X, so only fetch them when
+                // the panel is actually opened.
+                if (next && folders.length === 0 && !foldersLoading) {
+                  setFoldersLoading(true);
+                  xFolders()
+                    .then(setFolders)
+                    .catch(() => {})
+                    .finally(() => setFoldersLoading(false));
+                }
+              }}
+              disabled={syncing}
+              aria-expanded={syncOpen}
             >
               {syncing ? `Syncing ${syncBatch}…` : "Sync from X"}
             </button>
@@ -466,6 +484,65 @@ export default function App() {
           </form>
         </header>
 
+        {syncOpen && (
+          <div className="sync">
+            <label>
+              <span>From</span>
+              <select value={syncFolder} onChange={(e) => setSyncFolder(e.target.value)}>
+                <option value="">All bookmarks</option>
+                {folders.map((f) => (
+                  <option key={f} value={f}>
+                    {f}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <label>
+              <span>Media</span>
+              <select
+                value={syncKinds}
+                onChange={(e) => setSyncKinds(e.target.value as SyncKinds)}
+              >
+                <option value="all">Images and video</option>
+                <option value="images">Images only</option>
+                <option value="videos">Video only</option>
+              </select>
+            </label>
+
+            <label>
+              <span>Posted after</span>
+              <input type="date" value={syncFrom} onChange={(e) => setSyncFrom(e.target.value)} />
+            </label>
+
+            <label>
+              <span>and before</span>
+              <input type="date" value={syncTo} onChange={(e) => setSyncTo(e.target.value)} />
+            </label>
+
+            <label>
+              <span>Up to</span>
+              <select value={syncBatch} onChange={(e) => setSyncBatch(Number(e.target.value))}>
+                {SYNC_BATCH_OPTIONS.map((n) => (
+                  <option key={n} value={n}>
+                    {n} items
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <button type="button" className="sync__go" onClick={() => void runSync()} disabled={syncing}>
+              {syncing ? "Syncing…" : "Start sync"}
+            </button>
+
+            <p className="sync__note">
+              Videos take roughly 26s each; images are near-instant. Dates are
+              when the post was made, not when you bookmarked it.
+              {foldersLoading && " Loading folders…"}
+            </p>
+          </div>
+        )}
+
         {colorFilter && (
           <div className="filter">
             <span className="filter__chip" style={{ background: colorFilter }} />
@@ -492,6 +569,10 @@ export default function App() {
               <>
                 <strong>{notice.imported}</strong> imported
                 {notice.duplicates > 0 && <> · {notice.duplicates} already in library</>}
+                {notice.images !== undefined && (notice.images > 0 || notice.videos! > 0) && (
+                  <> ({notice.images} image{notice.images === 1 ? "" : "s"},{" "}
+                  {notice.videos} video{notice.videos === 1 ? "" : "s"})</>
+                )}
                 {notice.syncedFrom && <> · from {notice.syncedFrom}</>}
               </>
             )}

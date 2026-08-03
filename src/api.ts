@@ -6,6 +6,7 @@ import type {
   ColorMatch,
   DeleteReport,
   ImportReport,
+  SyncOptions,
   SyncReport,
 } from "./types";
 
@@ -70,5 +71,11 @@ export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number
 export const deleteAssets = (assetIds: number[]) =>
   invoke<DeleteReport>("delete_assets", { assetIds });
 
-/** Pulls the newest videos from the configured X bookmark folder. */
-export const syncFromX = (limit?: number) => invoke<SyncReport>("sync_from_x", { limit });
+/** Pulls images and videos from X bookmarks. */
+export const syncFromX = (opts: SyncOptions) =>
+  // Spread into a plain record: invoke wants an index signature, which a named
+  // interface does not satisfy.
+  invoke<SyncReport>("sync_from_x", { ...opts });
+
+/** Bookmark folder names, so the UI can offer them rather than hardcode one. */
+export const xFolders = () => invoke<string[]>("x_folders");

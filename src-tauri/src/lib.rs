@@ -36,6 +36,7 @@ pub fn run() {
             commands::move_to_board,
             commands::delete_assets,
             commands::sync_from_x,
+            commands::x_folders,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

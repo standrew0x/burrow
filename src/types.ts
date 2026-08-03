@@ -68,12 +68,27 @@ export interface DeleteReport {
   orphanedFiles: string[];
 }
 
+export type SyncKinds = "all" | "images" | "videos";
+
+export interface SyncOptions {
+  limit?: number;
+  /** Omit for every bookmark; set to sync one folder. */
+  folder?: string;
+  /** Inclusive YYYY-MM-DD bounds. */
+  from?: string;
+  to?: string;
+  kinds?: SyncKinds;
+}
+
 export interface SyncReport {
-  folder: string;
-  /** Videos the folder offered, before the limit was applied. */
-  available: number;
+  /** "all bookmarks" or the folder name. */
+  source: string;
+  /** Media items the window offered, before download. */
+  found: number;
   downloaded: number;
   imported: number;
   duplicates: number;
+  images: number;
+  videos: number;
   failed: FailedImport[];
 }

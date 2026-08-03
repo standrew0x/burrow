@@ -32,6 +32,11 @@ const LOADER_SCAN_BYTES: usize = 400_000;
 /// Timeline page size. X accepts up to 100.
 const PAGE_SIZE: u32 = 100;
 
+/// Hard cap on pages walked in one fetch. A narrow date window deep in the
+/// past would otherwise page through the entire bookmark history; better to
+/// return what was found than to hammer X indefinitely.
+const MAX_PAGES: usize = 40;
+
 #[derive(Debug)]
 pub enum XError {
     /// No session file, or it is unusable.
@@ -362,38 +367,80 @@ impl XClient {
             .collect())
     }
 
-    /// Videos in a folder, newest first, stopping after `limit`.
-    pub fn folder_videos(
+    /// Images and videos from bookmarks, newest first.
+    ///
+    /// The timeline is strictly newest-first, which makes the date window
+    /// cheap: anything newer than `to` is skipped, and the first post older
+    /// than `from` ends paging entirely rather than walking the whole history.
+    pub fn fetch_bookmarks(
         &self,
         spec: &QuerySpec,
-        folder_id: &str,
-        limit: usize,
-    ) -> std::result::Result<Vec<BookmarkVideo>, XError> {
-        let mut out: Vec<BookmarkVideo> = Vec::new();
-        let mut cursor: Option<String> = None;
+        source: &BookmarkSource,
+        opts: &FetchOptions,
+    ) -> std::result::Result<Vec<BookmarkMedia>, XError> {
+        let (op_name, base_vars) = match source {
+            BookmarkSource::All => (
+                "Bookmarks",
+                serde_json::json!({ "count": PAGE_SIZE, "includePromotedContent": false }),
+            ),
+            BookmarkSource::Folder(id) => (
+                "BookmarkFolderTimeline",
+                serde_json::json!({ "count": PAGE_SIZE, "bookmark_collection_id": id }),
+            ),
+        };
 
-        while out.len() < limit {
-            let mut vars = serde_json::json!({
-                "count": PAGE_SIZE,
-                "bookmark_collection_id": folder_id,
-            });
+        let mut out: Vec<BookmarkMedia> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0usize;
+
+        'paging: while out.len() < opts.limit && pages < MAX_PAGES {
+            pages += 1;
+            let mut vars = base_vars.clone();
             if let Some(c) = &cursor {
                 vars["cursor"] = Value::String(c.clone());
             }
 
-            let data = self.graphql(spec, "BookmarkFolderTimeline", vars)?;
+            let data = self.graphql(spec, op_name, vars)?;
             let (tweets, next) = extract_tweets_and_cursor(&data);
             if tweets.is_empty() {
                 break;
             }
+
             for tweet in &tweets {
-                if let Some(v) = video_from_tweet(tweet) {
-                    out.push(v);
-                    if out.len() == limit {
-                        break;
+                let all_items = media_from_tweet(tweet);
+                // Date is a property of the post, so read it before filtering by
+                // kind -- otherwise a photo-only post in an images-excluded sync
+                // would stop contributing its date and break the paging cutoff.
+                let Some(first) = all_items.first() else {
+                    continue;
+                };
+
+                // Undated posts are kept: dropping them would silently lose
+                // references over a parsing detail.
+                if !first.date.is_empty() {
+                    if let Some(from) = &opts.from {
+                        if first.date.as_str() < from.as_str() {
+                            break 'paging;
+                        }
+                    }
+                    if let Some(to) = &opts.to {
+                        if first.date.as_str() > to.as_str() {
+                            continue;
+                        }
+                    }
+                }
+
+                for item in all_items {
+                    if !opts.wants(item.kind) {
+                        continue;
+                    }
+                    out.push(item);
+                    if out.len() >= opts.limit {
+                        break 'paging;
                     }
                 }
             }
+
             match next {
                 Some(c) => cursor = Some(c),
                 None => break,
@@ -402,23 +449,26 @@ impl XClient {
         Ok(out)
     }
 
-    /// Streams a video to `dir`, named by tweet id. Returns the written path.
-    pub fn download(&self, video: &BookmarkVideo, dir: &Path) -> Result<PathBuf> {
-        let dest = dir.join(format!("x_{}.mp4", video.tweet_id));
+    /// Streams one media item to `dir`. Returns the written path.
+    ///
+    /// Named by tweet id plus position, so the four photos of a single post do
+    /// not overwrite each other.
+    pub fn download(&self, item: &BookmarkMedia, dir: &Path) -> Result<PathBuf> {
+        let dest = dir.join(format!("x_{}_{}.{}", item.tweet_id, item.index, item.ext));
         let mut resp = self
             .http
-            .get(&video.video_url)
+            .get(&item.media_url)
             .send()
-            .map_err(|e| Error::X(format!("downloading {}: {e}", video.tweet_url)))?;
+            .map_err(|e| Error::X(format!("downloading {}: {e}", item.tweet_url)))?;
         if !resp.status().is_success() {
             return Err(Error::X(format!(
                 "downloading {} returned HTTP {}",
-                video.tweet_url,
+                item.tweet_url,
                 resp.status().as_u16()
             )));
         }
         let mut file = std::fs::File::create(&dest).map_err(|e| Error::io(&dest, e))?;
-        // Streamed, not buffered: these run to 150MB.
+        // Streamed, not buffered: videos run to 150MB.
         std::io::copy(&mut resp, &mut file).map_err(|e| Error::io(&dest, e))?;
         Ok(dest)
     }
@@ -462,24 +512,99 @@ fn balanced_brace_blocks(text: &str, count: usize) -> Vec<&str> {
     blocks
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BookmarkKind {
+    Image,
+    Video,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BookmarkVideo {
+pub struct BookmarkMedia {
     pub tweet_id: String,
     pub tweet_url: String,
     pub author: String,
     pub text: String,
-    /// Highest-bitrate mp4 variant.
-    pub video_url: String,
-    pub bitrate: u64,
+    pub kind: BookmarkKind,
+    /// Highest-quality URL: best mp4 variant, or the original-size photo.
+    pub media_url: String,
+    /// File extension to save under.
+    pub ext: &'static str,
+    /// `YYYY-MM-DD` the post was created, for date filtering.
+    pub date: String,
+    /// Position within the post; a tweet can carry up to four photos.
+    pub index: usize,
+}
+
+/// Which bookmarks to read.
+pub enum BookmarkSource {
+    /// Every bookmark, across all folders and loose ones.
+    All,
+    /// A single folder, by id.
+    Folder(String),
+}
+
+#[derive(Debug, Clone)]
+pub struct FetchOptions {
+    pub limit: usize,
+    /// Inclusive `YYYY-MM-DD` bounds. `None` means unbounded on that side.
+    pub from: Option<String>,
+    pub to: Option<String>,
+    pub include_images: bool,
+    pub include_videos: bool,
+}
+
+impl Default for FetchOptions {
+    fn default() -> Self {
+        Self {
+            limit: 50,
+            from: None,
+            to: None,
+            // Both on by default: a sync that silently skipped half the
+            // bookmarks would look like a bug rather than a setting.
+            include_images: true,
+            include_videos: true,
+        }
+    }
+}
+
+impl FetchOptions {
+    fn wants(&self, kind: BookmarkKind) -> bool {
+        match kind {
+            BookmarkKind::Image => self.include_images,
+            BookmarkKind::Video => self.include_videos,
+        }
+    }
+}
+
+/// `Sun Aug 02 11:34:55 +0000 2026` -> `2026-08-02`.
+///
+/// Compared as strings: X always reports +0000, so lexicographic ordering on
+/// `YYYY-MM-DD` is chronological and needs no date library.
+fn parse_created_at(created_at: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let parts: Vec<&str> = created_at.split_whitespace().collect();
+    if parts.len() < 6 {
+        return None;
+    }
+    let month = MONTHS.iter().position(|m| *m == parts[1])? + 1;
+    let day: u32 = parts[2].parse().ok()?;
+    let year: i32 = parts[5].parse().ok()?;
+    Some(format!("{year:04}-{month:02}-{day:02}"))
 }
 
 fn extract_tweets_and_cursor(data: &Value) -> (Vec<Value>, Option<String>) {
     let mut tweets = Vec::new();
     let mut cursor = None;
 
+    // Folder timelines and the all-bookmarks timeline use different roots.
     let instructions = data
         .pointer("/bookmark_collection_timeline/timeline/instructions")
+        .or_else(|| data.pointer("/bookmark_timeline_v2/timeline/instructions"))
+        .or_else(|| data.pointer("/bookmark_timeline/timeline/instructions"))
         .and_then(|v| v.as_array());
     let Some(instructions) = instructions else {
         return (tweets, cursor);
@@ -516,15 +641,23 @@ fn extract_tweets_and_cursor(data: &Value) -> (Vec<Value>, Option<String>) {
     (tweets, cursor)
 }
 
-fn video_from_tweet(result: &Value) -> Option<BookmarkVideo> {
+/// Every downloadable image and video attached to a post.
+///
+/// Returns a list rather than one item: a post can carry up to four photos, and
+/// taking only the first would quietly drop three references.
+fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
     // Quoted/retweeted posts nest the real tweet one level down.
     let tweet = result.get("tweet").unwrap_or(result);
-    let legacy = tweet.get("legacy")?;
-    let tweet_id = legacy
+    let Some(legacy) = tweet.get("legacy") else {
+        return Vec::new();
+    };
+    let Some(tweet_id) = legacy
         .get("id_str")
         .and_then(|v| v.as_str())
-        .or_else(|| tweet.get("rest_id").and_then(|v| v.as_str()))?
-        .to_string();
+        .or_else(|| tweet.get("rest_id").and_then(|v| v.as_str()))
+    else {
+        return Vec::new();
+    };
 
     let author = tweet
         .pointer("/core/user_results/result/core/screen_name")
@@ -533,47 +666,86 @@ fn video_from_tweet(result: &Value) -> Option<BookmarkVideo> {
         .unwrap_or("")
         .to_string();
 
-    // extended_entities carries video; entities alone often does not.
-    let media = legacy
+    let date = legacy
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .and_then(parse_created_at)
+        .unwrap_or_default();
+
+    let text = legacy
+        .get("full_text")
+        .or_else(|| legacy.get("text"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // extended_entities carries video and the full photo set; entities alone
+    // often carries neither.
+    let Some(media) = legacy
         .pointer("/extended_entities/media")
         .or_else(|| legacy.pointer("/entities/media"))
-        .and_then(|v| v.as_array())?;
+        .and_then(|v| v.as_array())
+    else {
+        return Vec::new();
+    };
 
-    let mut best: Option<(u64, String)> = None;
-    for m in media {
-        let Some(variants) = m.pointer("/video_info/variants").and_then(|v| v.as_array()) else {
-            continue;
+    let mut out = Vec::new();
+    for (index, m) in media.iter().enumerate() {
+        let kind_str = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+        let found = match kind_str {
+            // animated_gif is served as a silent mp4, not a .gif.
+            "video" | "animated_gif" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
+            // Presence of video_info is the real signal; `type` is only a hint
+            // and has been absent on nested/quoted results.
+            "" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
+            "photo" => m
+                .get("media_url_https")
+                .or_else(|| m.get("media_url"))
+                .and_then(|u| u.as_str())
+                // Without ?name=orig X serves a downscaled render -- 1200px
+                // wide instead of the 2048px original.
+                .map(|u| (BookmarkKind::Image, format!("{u}?name=orig"), "jpg")),
+            _ => None,
         };
-        for v in variants {
-            // Skip the HLS playlist: it is a manifest, not a file, and would
-            // need a muxer to turn into something the library can store.
-            if v.get("content_type").and_then(|c| c.as_str()) != Some("video/mp4") {
-                continue;
-            }
-            let bitrate = v.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
-            let Some(url) = v.get("url").and_then(|u| u.as_str()) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|(b, _)| bitrate > *b) {
-                best = Some((bitrate, url.to_string()));
-            }
+
+        if let Some((kind, media_url, ext)) = found {
+            out.push(BookmarkMedia {
+                tweet_id: tweet_id.to_string(),
+                tweet_url: format!("https://x.com/{author}/status/{tweet_id}"),
+                author: author.clone(),
+                text: text.clone(),
+                kind,
+                media_url,
+                ext,
+                date: date.clone(),
+                index,
+            });
         }
     }
-    let (bitrate, video_url) = best?;
+    out
+}
 
-    Some(BookmarkVideo {
-        tweet_url: format!("https://x.com/{author}/status/{tweet_id}"),
-        tweet_id,
-        author,
-        text: legacy
-            .get("full_text")
-            .or_else(|| legacy.get("text"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
-        video_url,
-        bitrate,
-    })
+fn best_mp4(media: &Value) -> Option<String> {
+    let variants = media
+        .pointer("/video_info/variants")
+        .and_then(|v| v.as_array())?;
+    let mut best: Option<(u64, String)> = None;
+    for v in variants {
+        // Skip the HLS playlist: it is a manifest, not a file, and would need a
+        // muxer to turn into something the library can store.
+        if v.get("content_type").and_then(|c| c.as_str()) != Some("video/mp4") {
+            continue;
+        }
+        let bitrate = v.get("bitrate").and_then(|b| b.as_u64()).unwrap_or(0);
+        let Some(url) = v.get("url").and_then(|u| u.as_str()) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| bitrate > *b) {
+            best = Some((bitrate, url.to_string()));
+        }
+    }
+    best.map(|(_, url)| url)
 }
 
 #[cfg(test)]
@@ -621,26 +793,143 @@ mod tests {
             },
             "core": { "user_results": { "result": { "core": { "screen_name": "someone" } } } }
         });
-        let v = video_from_tweet(&tweet).expect("should find a video");
-        assert_eq!(v.video_url, "https://x/high.mp4");
-        assert_eq!(v.bitrate, 2176000);
-        assert_eq!(v.author, "someone");
-        assert_eq!(v.tweet_url, "https://x.com/someone/status/123");
+        let items = media_from_tweet(&tweet);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].media_url, "https://x/high.mp4");
+        assert_eq!(items[0].author, "someone");
+        assert_eq!(items[0].tweet_url, "https://x.com/someone/status/123");
     }
 
     #[test]
-    fn a_tweet_with_no_video_is_skipped() {
-        let photo = serde_json::json!({
+    fn created_at_parses_to_a_sortable_date() {
+        assert_eq!(
+            parse_created_at("Sun Aug 02 11:34:55 +0000 2026").as_deref(),
+            Some("2026-08-02")
+        );
+        assert_eq!(
+            parse_created_at("Wed Jan 05 00:00:01 +0000 2022").as_deref(),
+            Some("2022-01-05")
+        );
+        // Zero-padding is what makes string comparison chronological.
+        assert!(
+            parse_created_at("Wed Jan 05 00:00:01 +0000 2022").unwrap()
+                < parse_created_at("Sun Aug 02 11:34:55 +0000 2026").unwrap()
+        );
+        assert_eq!(parse_created_at("nonsense"), None);
+        assert_eq!(parse_created_at("Sun Xxx 02 11:34:55 +0000 2026"), None);
+    }
+
+    #[test]
+    fn photos_are_requested_at_original_size() {
+        let tweet = serde_json::json!({
             "legacy": {
-                "id_str": "1",
-                "extended_entities": { "media": [{ "type": "photo",
-                    "media_url_https": "https://x/p.jpg" }] }
+                "id_str": "5",
+                "created_at": "Sun Aug 02 11:34:55 +0000 2026",
+                "extended_entities": { "media": [{
+                    "type": "photo",
+                    "media_url_https": "https://pbs.twimg.com/media/ABC.jpg"
+                }]}
             }
         });
-        assert!(video_from_tweet(&photo).is_none());
+        let items = media_from_tweet(&tweet);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, BookmarkKind::Image);
+        assert_eq!(items[0].ext, "jpg");
+        // Without ?name=orig X serves a 1200px render of a 2048px original.
+        assert!(
+            items[0].media_url.ends_with("?name=orig"),
+            "got {}",
+            items[0].media_url
+        );
+        assert_eq!(items[0].date, "2026-08-02");
+    }
 
+    #[test]
+    fn all_four_photos_of_a_post_are_returned() {
+        let media: Vec<_> = (0..4)
+            .map(|i| {
+                serde_json::json!({
+                    "type": "photo",
+                    "media_url_https": format!("https://pbs.twimg.com/media/P{i}.jpg")
+                })
+            })
+            .collect();
+        let tweet = serde_json::json!({
+            "legacy": { "id_str": "7", "extended_entities": { "media": media } }
+        });
+        let items = media_from_tweet(&tweet);
+        assert_eq!(items.len(), 4, "taking only the first would drop three");
+        // Indexes must differ or the downloads overwrite each other.
+        let indexes: Vec<usize> = items.iter().map(|i| i.index).collect();
+        assert_eq!(indexes, vec![0, 1, 2, 3]);
+    }
+
+    #[test]
+    fn animated_gifs_are_treated_as_video() {
+        let tweet = serde_json::json!({
+            "legacy": { "id_str": "8", "extended_entities": { "media": [{
+                "type": "animated_gif",
+                "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 0, "url": "https://x/g.mp4" }
+                ]}
+            }]}}
+        });
+        let items = media_from_tweet(&tweet);
+        assert_eq!(items.len(), 1);
+        // X serves these as silent mp4, not .gif.
+        assert_eq!(items[0].kind, BookmarkKind::Video);
+        assert_eq!(items[0].ext, "mp4");
+    }
+
+    #[test]
+    fn a_post_with_both_a_photo_and_a_video_yields_both() {
+        let tweet = serde_json::json!({
+            "legacy": { "id_str": "9", "extended_entities": { "media": [
+                { "type": "photo", "media_url_https": "https://x/a.jpg" },
+                { "type": "video", "video_info": { "variants": [
+                    { "content_type": "video/mp4", "bitrate": 100, "url": "https://x/b.mp4" }
+                ]}}
+            ]}}
+        });
+        let items = media_from_tweet(&tweet);
+        assert_eq!(items.len(), 2);
+        assert!(items.iter().any(|i| i.kind == BookmarkKind::Image));
+        assert!(items.iter().any(|i| i.kind == BookmarkKind::Video));
+    }
+
+    #[test]
+    fn kind_filter_selects_what_is_wanted() {
+        let images_only = FetchOptions {
+            include_videos: false,
+            ..Default::default()
+        };
+        assert!(images_only.wants(BookmarkKind::Image));
+        assert!(!images_only.wants(BookmarkKind::Video));
+
+        let videos_only = FetchOptions {
+            include_images: false,
+            ..Default::default()
+        };
+        assert!(videos_only.wants(BookmarkKind::Video));
+        assert!(!videos_only.wants(BookmarkKind::Image));
+
+        // The default must take everything.
+        let both = FetchOptions::default();
+        assert!(both.wants(BookmarkKind::Image) && both.wants(BookmarkKind::Video));
+    }
+
+    #[test]
+    fn a_post_with_no_media_yields_nothing() {
         let text_only = serde_json::json!({ "legacy": { "id_str": "2" } });
-        assert!(video_from_tweet(&text_only).is_none());
+        assert!(media_from_tweet(&text_only).is_empty());
+
+        // A link card is not downloadable media.
+        let link = serde_json::json!({
+            "legacy": { "id_str": "3", "extended_entities": { "media": [
+                { "type": "something_else", "media_url_https": "https://x/x.bin" }
+            ]}}
+        });
+        assert!(media_from_tweet(&link).is_empty());
     }
 
     #[test]
@@ -655,7 +944,7 @@ mod tests {
                 }]}
             }
         }});
-        assert_eq!(video_from_tweet(&wrapped).unwrap().tweet_id, "9");
+        assert_eq!(media_from_tweet(&wrapped)[0].tweet_id, "9");
     }
 
     #[test]

@@ -292,6 +292,73 @@ button:focus-visible {
   border-color: var(--accent);
 }
 
+/* ---------- sync panel ---------- */
+
+.sync {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px 18px;
+  align-items: flex-end;
+  padding: 14px 20px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.sync label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+}
+
+.sync label span {
+  color: var(--ink-dim);
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.sync select,
+.sync input[type="date"] {
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.sync select:focus-visible,
+.sync input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.sync__go {
+  padding: 7px 16px;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.sync__go:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+
+/* Full-width so it wraps below the controls rather than squeezing them. */
+.sync__note {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--ink-dim);
+  font-size: 11.5px;
+}
+
 /* ---------- filter + banners ---------- */
 
 .filter,

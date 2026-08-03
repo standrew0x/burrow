@@ -4,7 +4,7 @@
 //!   cargo run --example xsync_probe -- <library-root> [folder] [limit]
 
 use burrow_lib::store::Library;
-use burrow_lib::xsync::{XClient, XSession};
+use burrow_lib::xsync::{BookmarkSource, FetchOptions, XClient, XSession};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -61,20 +61,26 @@ fn main() {
         std::process::exit(1);
     };
 
-    println!("\nfetching up to {limit} videos from {folder_name:?}...");
-    let videos = match client.folder_videos(&specs[1], folder_id, limit) {
+    println!("\nfetching up to {limit} media items from {folder_name:?}...");
+    let opts = FetchOptions {
+        limit,
+        ..Default::default()
+    };
+    let source = BookmarkSource::Folder(folder_id.clone());
+    let videos = match client.fetch_bookmarks(&specs[1], &source, &opts) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  {e}");
             std::process::exit(1);
         }
     };
-    println!("  {} video(s)", videos.len());
+    println!("  {} item(s)", videos.len());
     for v in &videos {
         println!(
-            "    @{:<20} {:>5}kbps  {}",
+            "    @{:<20} {:<6} {:<12} {}",
             v.author,
-            v.bitrate / 1000,
+            format!("{:?}", v.kind).to_lowercase(),
+            v.date,
             v.tweet_url
         );
     }
