@@ -40,6 +40,8 @@ export interface Asset {
   sourceUrl: string | null;
   /** The media file on the remote host; present only while linked. */
   remoteUrl: string | null;
+  /** The user's own note. Null when unset — never an empty string. */
+  note: string | null;
   importedAt: number;
   swatches: Swatch[];
   /** Absolute path; run through convertFileSrc before use in an <img>. */

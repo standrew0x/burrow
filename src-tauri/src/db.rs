@@ -118,6 +118,19 @@ const MIGRATIONS: &[&str] = &[
     CREATE UNIQUE INDEX assets_remote_url ON assets(remote_url)
         WHERE remote_url IS NOT NULL;
     "#,
+    // --- v5: notes ---
+    //
+    // One editable note per reference rather than a thread of timestamped
+    // comments. Nobody else can read this library, so there is no conversation
+    // to model -- the real content is "what I thought about this image", which
+    // is a single piece of text a person revises rather than appends to.
+    //
+    // NULL means no note. The writer normalises whitespace-only input to NULL
+    // so that "cleared the note" and "never wrote one" cannot drift into two
+    // states that look identical but compare differently.
+    r#"
+    ALTER TABLE assets ADD COLUMN note TEXT;
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.
@@ -330,6 +343,58 @@ mod tests {
             Some("legacy"),
             "the backfill skipped a row that predated the migration"
         );
+    }
+
+    #[test]
+    fn v5_leaves_existing_rows_without_a_note() {
+        let conn = open_in_memory().expect("open");
+        conn.execute(
+            "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+             VALUES ('abc', 'png', 'image/png', 1, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let note: Option<String> = conn
+            .query_row("SELECT note FROM assets WHERE hash='abc'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(note, None, "no note is NULL, not an empty string");
+    }
+
+    #[test]
+    fn a_v4_library_upgrades_without_losing_links() {
+        // The upgrade path a real 0.4.0 library takes. Notes were added after
+        // links shipped, so a library holding linked references has to survive
+        // it with those references intact.
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(4) {
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {};\nCOMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO assets
+                (hash, ext, mime, width, height, bytes, imported_at, state, remote_url)
+             VALUES ('link1','mp4','video/mp4',16,9,0,0,'linked','https://video.twimg.com/a.mp4')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).expect("upgrade v4 -> latest");
+
+        let (state, remote, note): (String, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT state, remote_url, note FROM assets WHERE hash='link1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "linked", "the reference stopped being a link");
+        assert_eq!(remote.as_deref(), Some("https://video.twimg.com/a.mp4"));
+        assert_eq!(note, None);
     }
 
     #[test]

@@ -164,6 +164,36 @@ pub fn move_to_board(
     crate::boards::move_to_board(&mut conn, from_board, to_board, &asset_ids)
 }
 
+// --- notes ---
+
+/// Writes or clears the note on one reference. Returns the stored value, which
+/// is `None` when the note was blanked.
+#[tauri::command]
+pub fn set_note(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+    note: String,
+) -> Result<Option<String>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::set_note(&conn, asset_id, &note)
+}
+
+/// References whose note contains `query`.
+#[tauri::command]
+pub fn search_notes(
+    state: tauri::State<'_, AppState>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<AssetRow>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::search_notes(
+        &state.library,
+        &conn,
+        &query,
+        limit.unwrap_or(DEFAULT_PAGE_SIZE),
+    )
+}
+
 /// Permanently deletes references and their stored files.
 #[tauri::command]
 pub fn delete_assets(

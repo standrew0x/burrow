@@ -20,6 +20,8 @@ import {
   removeFromBoard,
   renameBoard,
   searchByColor,
+  searchNotes,
+  setNote,
   syncFromX,
   thumbUrl,
   clearXSession,
@@ -128,6 +130,11 @@ export default function App() {
   const [activeBoardId, setActiveBoardId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [linkInput, setLinkInput] = useState("");
+  /** Reference whose note is open for editing, and the draft text. */
+  const [editingNote, setEditingNote] = useState<number | null>(null);
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteQuery, setNoteQuery] = useState("");
+  const [noteFilter, setNoteFilter] = useState<string | null>(null);
   const [addingLinks, setAddingLinks] = useState(false);
   const [syncDownload, setSyncDownload] = useState(false);
   /** Ids currently being fetched, so their tiles can show it. */
@@ -150,6 +157,8 @@ export default function App() {
     try {
       if (activeBoardId !== null) {
         setAssets(await listBoardAssets(activeBoardId, 500, 0));
+      } else if (noteFilter) {
+        setAssets(await searchNotes(noteFilter, 500));
       } else if (colorFilter) {
         const matches = await searchByColor(colorFilter, COLOR_TOLERANCE, 500);
         setAssets(matches.map((m) => m.asset));
@@ -162,7 +171,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [activeBoardId, colorFilter]);
+  }, [activeBoardId, colorFilter, noteFilter]);
 
   useEffect(() => {
     void refresh();
@@ -354,6 +363,34 @@ export default function App() {
     [refresh, refreshBoards],
   );
 
+  const openNote = (asset: Asset) => {
+    setEditingNote(asset.id);
+    setNoteDraft(asset.note ?? "");
+  };
+
+  const cancelNote = () => {
+    setEditingNote(null);
+    setNoteDraft("");
+  };
+
+  const saveNote = async (assetId: number) => {
+    const draft = noteDraft;
+    // Close first: the write is fast and local, and leaving the editor open
+    // until the round trip returns makes typing feel like it stuck.
+    setEditingNote(null);
+    setNoteDraft("");
+    try {
+      const stored = await setNote(assetId, draft);
+      // Patch in place rather than refetching the whole grid, which would
+      // scroll the user away from what they were annotating.
+      setAssets((prev) =>
+        prev.map((a) => (a.id === assetId ? { ...a, note: stored } : a)),
+      );
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
   const toggleSelected = (id: number) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -375,6 +412,8 @@ export default function App() {
     setActiveBoardId(id);
     setColorFilter(null);
     setHexInput("");
+    setNoteFilter(null);
+    setNoteQuery("");
     clearSelection();
   };
 
@@ -419,6 +458,7 @@ export default function App() {
     if (!value) return;
     // Colour search spans the whole library, so it leaves any active board.
     setActiveBoardId(null);
+    setNoteFilter(null);
     setColorFilter(value.startsWith("#") ? value : `#${value}`);
     clearSelection();
   };
@@ -511,9 +551,10 @@ export default function App() {
     if (activeBoard) {
       return `${assets.length} on ${activeBoard.name}`;
     }
+    if (noteFilter) return `${assets.length} noting “${noteFilter}”`;
     if (colorFilter) return `${assets.length} matching ${colorFilter}`;
     return `${assets.length} reference${assets.length === 1 ? "" : "s"}`;
-  }, [loading, importingCount, activeBoard, colorFilter, assets.length]);
+  }, [loading, importingCount, activeBoard, colorFilter, noteFilter, assets.length]);
 
   return (
     <div className={`app${dragging ? " app--dragging" : ""}`}>
@@ -662,6 +703,43 @@ export default function App() {
             <button type="submit" disabled={addingLinks || !urlsIn(linkInput).length}>
               {addingLinks ? "Adding…" : "Add link"}
             </button>
+          </form>
+
+          <form
+            className="bar__search"
+            onSubmit={(e) => {
+              e.preventDefault();
+              const q = noteQuery.trim();
+              if (!q) return;
+              // Searching notes spans the library, so it leaves any board or
+              // colour filter rather than intersecting with them.
+              setActiveBoardId(null);
+              setColorFilter(null);
+              setHexInput("");
+              setNoteFilter(q);
+              clearSelection();
+            }}
+          >
+            <input
+              type="search"
+              value={noteQuery}
+              onChange={(e) => setNoteQuery(e.target.value)}
+              placeholder="Search notes…"
+              aria-label="Search notes"
+            />
+            <button type="submit">Find</button>
+            {noteFilter && (
+              <button
+                type="button"
+                className="bar__clear"
+                onClick={() => {
+                  setNoteFilter(null);
+                  setNoteQuery("");
+                }}
+              >
+                Clear
+              </button>
+            )}
           </form>
 
           <form className="bar__search" onSubmit={submitHex}>
@@ -910,16 +988,20 @@ export default function App() {
             <p className="empty__headline">
               {activeBoard
                 ? "This board is empty."
-                : colorFilter
-                  ? "Nothing matches that colour."
-                  : "Drop images or video here, or paste a link."}
+                : noteFilter
+                  ? `No notes mention “${noteFilter}”.`
+                  : colorFilter
+                    ? "Nothing matches that colour."
+                    : "Drop images or video here, or paste a link."}
             </p>
             <p className="empty__detail">
               {activeBoard
                 ? "Go to All references, select some tiles, and add them here."
-                : colorFilter
-                  ? "Try a different hue — the tolerance is deliberately tight."
-                  : "Drag files or folders from Explorer, or press Ctrl+V with a link copied. Linked references store only a thumbnail until you download them."}
+                : noteFilter
+                  ? "Notes match on any part of a word, so try a shorter fragment."
+                  : colorFilter
+                    ? "Try a different hue — the tolerance is deliberately tight."
+                    : "Drag files or folders from Explorer, or press Ctrl+V with a link copied. Linked references store only a thumbnail until you download them."}
             </p>
             {root && !colorFilter && !activeBoard && (
               <code className="empty__path">{root}</code>
@@ -987,6 +1069,17 @@ export default function App() {
                     >
                       {isSelected ? "✓" : ""}
                     </button>
+                    {/* Stays visible once a note exists, so an annotated tile
+                        is identifiable without hovering every one. */}
+                    <button
+                      type="button"
+                      className={`tile__note${asset.note ? " tile__note--has" : ""}`}
+                      onClick={() => openNote(asset)}
+                      title={asset.note ?? "Add a note"}
+                      aria-label={asset.note ? "Edit note" : "Add a note"}
+                    >
+                      {asset.note ? "✎" : "+"}
+                    </button>
                   </div>
                   <figcaption className="tile__meta">
                     <span className="tile__name">
@@ -1003,6 +1096,44 @@ export default function App() {
                       )}
                     </span>
                   </figcaption>
+                  {editingNote === asset.id ? (
+                    <div className="note note--editing">
+                      <textarea
+                        className="note__input"
+                        value={noteDraft}
+                        onChange={(e) => setNoteDraft(e.target.value)}
+                        placeholder="What is this for?"
+                        rows={3}
+                        autoFocus
+                        onKeyDown={(e) => {
+                          // Enter inserts a newline; notes are prose. Ctrl+Enter
+                          // commits, Escape abandons — the shape people expect
+                          // from an inline editor.
+                          if (e.key === "Escape") {
+                            e.preventDefault();
+                            cancelNote();
+                          } else if (e.key === "Enter" && (e.ctrlKey || e.metaKey)) {
+                            e.preventDefault();
+                            void saveNote(asset.id);
+                          }
+                        }}
+                        // Clicking away saves rather than discarding: losing
+                        // typing to a stray click is the worse failure.
+                        onBlur={() => void saveNote(asset.id)}
+                      />
+                      <div className="note__hint">Ctrl+Enter saves · Esc cancels</div>
+                    </div>
+                  ) : (
+                    asset.note && (
+                      <p
+                        className="note"
+                        onClick={() => openNote(asset)}
+                        title="Click to edit"
+                      >
+                        {asset.note}
+                      </p>
+                    )
+                  )}
                   <div className="palette">
                     {asset.swatches.map((s, i) => (
                       <button

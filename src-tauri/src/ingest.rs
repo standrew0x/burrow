@@ -107,6 +107,8 @@ pub struct AssetRow {
     /// The media file on the remote host. Present only while linked, and what
     /// the player streams from.
     pub remote_url: Option<String>,
+    /// The user's own note. `None` when unset; never an empty string.
+    pub note: Option<String>,
     pub imported_at: i64,
     pub swatches: Vec<Swatch>,
     /// Absolute path to the thumbnail, included on every row so the grid does
@@ -362,6 +364,7 @@ pub fn import_paths(
             original_name: p.original_name.clone(),
             source_url: None,
             remote_url: None,
+            note: None,
             imported_at,
             swatches: p.swatches.clone(),
             thumb_path: lib.thumb_path(&p.hash).display().to_string(),
@@ -638,6 +641,7 @@ pub fn import_links(
             original_name: r.link.title.clone(),
             source_url: Some(r.link.page_url.clone()),
             remote_url: Some(r.link.media_url.clone()),
+            note: None,
             imported_at,
             swatches: r.swatches.clone(),
             thumb_path: lib.thumb_path(&r.hash).display().to_string(),
@@ -1009,7 +1013,7 @@ pub fn list_assets(
 /// positionally. Kept in one place because the indices below depend on it.
 pub(crate) const ASSET_COLUMNS: &str =
     "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
-            original_name, source_url, imported_at, state, remote_url
+            original_name, source_url, imported_at, state, remote_url, note
      FROM assets";
 
 pub(crate) fn row_to_asset(lib: &Library, r: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
@@ -1032,6 +1036,7 @@ pub(crate) fn row_to_asset(lib: &Library, r: &rusqlite::Row) -> rusqlite::Result
         imported_at: r.get(11)?,
         state: AssetState::from_str(&r.get::<_, String>(12)?),
         remote_url: r.get(13)?,
+        note: r.get(14)?,
         swatches: Vec::new(),
     })
 }
@@ -1127,6 +1132,78 @@ pub fn search_by_color(
         if let Some(asset) = asset_by_id(lib, conn, asset_id)? {
             out.push(ColorMatch { asset, distance });
         }
+    }
+    Ok(out)
+}
+
+// --- notes ---
+
+/// Longest note kept. Generous for a caption and far short of a document; the
+/// cap exists so a stray paste cannot put a megabyte into every grid query,
+/// since notes ride along on every row the UI reads.
+pub const MAX_NOTE_LEN: usize = 4000;
+
+/// Writes (or clears) a reference's note. Returns the stored value.
+///
+/// Blank input clears rather than storing `""`. Otherwise "cleared the note"
+/// and "never wrote one" become two states that render identically but compare
+/// differently, and every later `IS NULL` check has to remember both.
+pub fn set_note(conn: &Connection, asset_id: i64, note: &str) -> Result<Option<String>> {
+    let trimmed = note.trim();
+    let stored: Option<String> = if trimmed.is_empty() {
+        None
+    } else {
+        // Truncated on a character boundary; slicing bytes would panic on the
+        // first multi-byte character, and notes are free text.
+        Some(trimmed.chars().take(MAX_NOTE_LEN).collect())
+    };
+
+    let changed = conn.execute(
+        "UPDATE assets SET note = ?1 WHERE id = ?2",
+        rusqlite::params![stored, asset_id],
+    )?;
+    if changed == 0 {
+        return Err(Error::Link(format!("no reference with id {asset_id}")));
+    }
+    Ok(stored)
+}
+
+/// References whose note contains `query`, newest first.
+///
+/// Case-insensitive substring rather than full-text: notes are short and the
+/// library is one person's, so a scan is immeasurably fast and behaves the way
+/// people expect from a search box -- a partial word matches. FTS5 would need
+/// token-boundary matching and an index to maintain, for no gain at this size.
+pub fn search_notes(
+    lib: &Library,
+    conn: &Connection,
+    query: &str,
+    limit: i64,
+) -> Result<Vec<AssetRow>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // `%` and `_` are wildcards in LIKE. A user typing them means the literal
+    // characters, so they are escaped rather than silently widening the search.
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+
+    let mut stmt = conn.prepare(&format!(
+        "{ASSET_COLUMNS} WHERE note IS NOT NULL AND note LIKE ?1 ESCAPE '\\'
+         ORDER BY imported_at DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![pattern, limit], |r| row_to_asset(lib, r))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    let mut out = rows;
+    for asset in &mut out {
+        asset.swatches = swatches_for(conn, asset.id)?;
     }
     Ok(out)
 }
@@ -1523,6 +1600,150 @@ mod tests {
             "unhelpful message: {}",
             done.failed[0].reason
         );
+    }
+
+    #[test]
+    fn a_note_round_trips_and_clears_to_null() {
+        let mut fx = Fixture::new("note-basic");
+        let path = fx.write_png("a.png", 8, 8, [1, 2, 3, 255]);
+        let id = import_paths(&fx.lib, &mut fx.conn, &[path])
+            .unwrap()
+            .imported[0]
+            .id;
+
+        set_note(&fx.conn, id, "  use this grain  ").expect("set");
+        let asset = asset_by_id(&fx.lib, &fx.conn, id).unwrap().unwrap();
+        assert_eq!(
+            asset.note.as_deref(),
+            Some("use this grain"),
+            "surrounding whitespace should not be stored"
+        );
+
+        // Blanking must clear rather than store "", so that "cleared" and
+        // "never set" are one state rather than two that look alike.
+        set_note(&fx.conn, id, "   ").expect("clear");
+        let asset = asset_by_id(&fx.lib, &fx.conn, id).unwrap().unwrap();
+        assert_eq!(asset.note, None);
+    }
+
+    #[test]
+    fn a_note_survives_on_a_linked_reference_and_after_downloading() {
+        let fx0 = Fixture::new("note-dl-src");
+        let Some(source) = write_video(&fx0.dir.clone(), "src.mp4", 3) else {
+            eprintln!("ffmpeg unavailable; skipping");
+            return;
+        };
+        let mut fx = Fixture::new("note-download");
+        let real = fx.dir.join("real.mp4");
+        std::fs::copy(&source, &real).unwrap();
+
+        let id = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/noted.mp4",
+                MediaKind::Video,
+                [3, 3, 3, 255],
+            )],
+        )
+        .unwrap()
+        .imported[0]
+            .id;
+
+        set_note(&fx.conn, id, "opening shot reference").unwrap();
+
+        let done = download_assets(
+            &fx.lib,
+            &mut fx.conn,
+            &[id],
+            |_url, dest| std::fs::copy(&real, dest).map_err(|e| Error::io(dest, e)),
+            |_, _, _| {},
+        )
+        .expect("download");
+
+        assert_eq!(done.downloaded.len(), 1, "{:?}", done.failed);
+        // Downloading rewrites most of the row; the note is the user's and must
+        // not be collateral damage.
+        assert_eq!(
+            done.downloaded[0].note.as_deref(),
+            Some("opening shot reference")
+        );
+    }
+
+    #[test]
+    fn notes_are_searchable_by_substring() {
+        let mut fx = Fixture::new("note-search");
+        let a = fx.write_png("a.png", 8, 8, [10, 0, 0, 255]);
+        let b = fx.write_png("b.png", 8, 8, [0, 10, 0, 255]);
+        let c = fx.write_png("c.png", 8, 8, [0, 0, 10, 255]);
+        let r = import_paths(&fx.lib, &mut fx.conn, &[a, b, c]).unwrap();
+
+        set_note(&fx.conn, r.imported[0].id, "Bauhaus stairwell").unwrap();
+        set_note(&fx.conn, r.imported[1].id, "brutalist CONCRETE").unwrap();
+        // Third gets no note and must never appear.
+
+        assert_eq!(
+            search_notes(&fx.lib, &fx.conn, "bauhaus", 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        // Case-insensitive, and matching mid-word is the point of substring.
+        assert_eq!(
+            search_notes(&fx.lib, &fx.conn, "concrete", 50)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            search_notes(&fx.lib, &fx.conn, "stair", 50).unwrap().len(),
+            1
+        );
+        assert_eq!(
+            search_notes(&fx.lib, &fx.conn, "zebra", 50).unwrap().len(),
+            0
+        );
+        // An empty query is not "match everything".
+        assert_eq!(search_notes(&fx.lib, &fx.conn, "  ", 50).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn like_wildcards_typed_by_a_user_are_literal() {
+        let mut fx = Fixture::new("note-wildcards");
+        let a = fx.write_png("a.png", 8, 8, [10, 0, 0, 255]);
+        let b = fx.write_png("b.png", 8, 8, [0, 10, 0, 255]);
+        let r = import_paths(&fx.lib, &mut fx.conn, &[a, b]).unwrap();
+        set_note(&fx.conn, r.imported[0].id, "grade 100% matched").unwrap();
+        set_note(&fx.conn, r.imported[1].id, "no percent here").unwrap();
+
+        // Unescaped, "%" is LIKE's match-anything and would return both.
+        let hits = search_notes(&fx.lib, &fx.conn, "100%", 50).unwrap();
+        assert_eq!(hits.len(), 1, "% was treated as a wildcard");
+        assert_eq!(hits[0].note.as_deref(), Some("grade 100% matched"));
+
+        // Same for "_", which matches any single character.
+        assert_eq!(search_notes(&fx.lib, &fx.conn, "_", 50).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn a_note_on_a_missing_reference_is_an_error_not_a_silent_no_op() {
+        let fx = Fixture::new("note-missing");
+        assert!(set_note(&fx.conn, 9999, "hello").is_err());
+    }
+
+    #[test]
+    fn an_overlong_note_is_truncated_on_a_character_boundary() {
+        let mut fx = Fixture::new("note-long");
+        let path = fx.write_png("a.png", 8, 8, [1, 2, 3, 255]);
+        let id = import_paths(&fx.lib, &mut fx.conn, &[path])
+            .unwrap()
+            .imported[0]
+            .id;
+
+        // Multi-byte throughout: byte slicing here would panic.
+        let huge = "é".repeat(MAX_NOTE_LEN + 500);
+        let stored = set_note(&fx.conn, id, &huge).expect("set");
+        assert_eq!(stored.unwrap().chars().count(), MAX_NOTE_LEN);
     }
 
     #[test]

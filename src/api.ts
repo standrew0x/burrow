@@ -85,6 +85,17 @@ export const listBoardAssets = (boardId: number, limit?: number, offset?: number
 export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number[]) =>
   invoke<number>("move_to_board", { fromBoard, toBoard, assetIds });
 
+/**
+ * Writes or clears a reference's note. Blank input clears it; the stored value
+ * comes back, so the caller never has to guess what normalisation did.
+ */
+export const setNote = (assetId: number, note: string) =>
+  invoke<string | null>("set_note", { assetId, note });
+
+/** References whose note contains `query`, case-insensitively. */
+export const searchNotes = (query: string, limit?: number) =>
+  invoke<Asset[]>("search_notes", { query, limit });
+
 /** Permanent: removes the rows and unlinks the stored files. */
 export const deleteAssets = (assetIds: number[]) =>
   invoke<DeleteReport>("delete_assets", { assetIds });

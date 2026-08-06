@@ -51,6 +51,8 @@ pub fn run() {
             commands::list_board_assets,
             commands::move_to_board,
             commands::delete_assets,
+            commands::set_note,
+            commands::search_notes,
             commands::sync_from_x,
             commands::x_folders,
             commands::x_status,

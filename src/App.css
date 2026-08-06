@@ -722,6 +722,83 @@ button:focus-visible {
   color: var(--accent);
 }
 
+/* Bottom-right, so it clears the selection box (top-left) and the download
+   badge (top-right). Hidden until hover unless a note exists — an annotated
+   tile has to be recognisable at a glance without pointing at it. */
+.tile__note {
+  position: absolute;
+  right: 7px;
+  bottom: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font-size: 12px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.7);
+  border-radius: 5px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 100ms;
+}
+
+.tile:hover .tile__note,
+.tile__note:focus-visible,
+.tile__note--has {
+  opacity: 1;
+}
+
+.tile__note--has {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.note {
+  margin: 0;
+  padding: 6px 10px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink-dim);
+  /* Notes are free text and can run long; the tile must not stretch to fit
+     one. Wrapping mid-word keeps a pasted URL from widening the column. */
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  cursor: pointer;
+}
+
+.note--editing {
+  cursor: default;
+}
+
+.note__input {
+  width: 100%;
+  padding: 6px 8px;
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--accent);
+  border-radius: 5px;
+  /* Free vertical drag would let one tile tower over its neighbours and break
+     the grid's rhythm. */
+  resize: none;
+}
+
+.note__input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.note__hint {
+  margin-top: 3px;
+  font-size: 10px;
+  color: var(--ink-dim);
+}
+
 .tile__select--on {
   color: #fff;
   background: var(--accent);
