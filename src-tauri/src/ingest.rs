@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use rayon::prelude::*;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::Serialize;
 
 use crate::color::{palette_from_pixels, Swatch};
@@ -57,28 +57,63 @@ impl MediaKind {
     }
 }
 
+/// Whether the library holds this reference's bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetState {
+    /// The file is in the blob store.
+    Local,
+    /// Only a thumbnail and a URL. Plays by streaming from the remote host,
+    /// and becomes `Local` when downloaded.
+    Linked,
+}
+
+impl AssetState {
+    fn as_str(self) -> &'static str {
+        match self {
+            AssetState::Local => "local",
+            AssetState::Linked => "linked",
+        }
+    }
+
+    fn from_str(s: &str) -> Self {
+        match s {
+            "linked" => AssetState::Linked,
+            _ => AssetState::Local,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetRow {
     pub id: i64,
     pub hash: String,
     pub kind: MediaKind,
-    /// Present for video only.
+    pub state: AssetState,
+    /// Present for video only, and only once the bytes are local -- a link has
+    /// no duration until something has actually read the file.
     pub duration_ms: Option<i64>,
     pub ext: String,
     pub mime: String,
     pub width: u32,
     pub height: u32,
+    /// Size on disk. Zero for a link, which is the honest answer: the library
+    /// is storing a thumbnail, not a video.
     pub bytes: i64,
     pub original_name: Option<String>,
+    /// The page this came from -- a post, a video page -- for "open original".
     pub source_url: Option<String>,
+    /// The media file on the remote host. Present only while linked, and what
+    /// the player streams from.
+    pub remote_url: Option<String>,
     pub imported_at: i64,
     pub swatches: Vec<Swatch>,
     /// Absolute path to the thumbnail, included on every row so the grid does
     /// not need one IPC round-trip per tile to render.
     pub thumb_path: String,
-    /// Absolute path to the stored original. Used for video playback; images
-    /// render from the thumbnail.
+    /// Absolute path to the stored original. Meaningless while linked -- the
+    /// file is not there -- so the UI branches on `state` before using it.
     pub blob_path: String,
 }
 
@@ -288,8 +323,8 @@ pub fn import_paths(
         tx.execute(
             "INSERT INTO assets
                 (hash, kind, duration_ms, ext, mime, width, height, bytes,
-                 original_name, imported_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                 original_name, imported_at, state, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'local', ?1)",
             rusqlite::params![
                 p.hash,
                 p.kind.as_str(),
@@ -317,6 +352,7 @@ pub fn import_paths(
             id,
             hash: p.hash.clone(),
             kind: p.kind,
+            state: AssetState::Local,
             duration_ms: p.duration_ms,
             ext: p.ext.clone(),
             mime: p.mime.clone(),
@@ -325,6 +361,7 @@ pub fn import_paths(
             bytes: p.bytes,
             original_name: p.original_name.clone(),
             source_url: None,
+            remote_url: None,
             imported_at,
             swatches: p.swatches.clone(),
             thumb_path: lib.thumb_path(&p.hash).display().to_string(),
@@ -440,6 +477,444 @@ fn prepare_video(
     })
 }
 
+// --- linked references ---
+
+/// A resolved link, ready to become a row.
+///
+/// Deliberately not [`link::Resolved`]: X sync produces these too, and it has
+/// no business going through the URL resolver for media it already parsed out
+/// of the timeline API.
+pub struct PendingLink {
+    pub page_url: String,
+    pub media_url: String,
+    pub kind: MediaKind,
+    pub title: Option<String>,
+    /// Encoded still image, in whatever format the source served.
+    pub thumbnail: Vec<u8>,
+}
+
+/// The storage key for a link.
+///
+/// Digest of the media URL, not of any bytes: there are none yet. This is what
+/// names the thumbnail file, and -- once downloaded -- the blob, which is why
+/// it must not change when the real content hash finally becomes known.
+pub fn link_hash(media_url: &str) -> String {
+    store::hash_bytes(media_url.as_bytes())
+}
+
+/// Container extension implied by a media URL.
+fn ext_from_url(url: &str, kind: MediaKind) -> String {
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let candidate = path
+        .rsplit('/')
+        .next()
+        .and_then(|f| f.rsplit_once('.'))
+        .map(|(_, e)| e.to_ascii_lowercase());
+
+    match candidate {
+        Some(e)
+            if (kind == MediaKind::Video && video::VIDEO_EXTENSIONS.contains(&e.as_str()))
+                || (kind == MediaKind::Image && IMAGE_EXTENSIONS.contains(&e.as_str())) =>
+        {
+            e
+        }
+        // A URL that names no usable extension is normal -- CDN paths and
+        // player pages routinely have none.
+        _ => match kind {
+            MediaKind::Video => "mp4".to_string(),
+            MediaKind::Image => "jpg".to_string(),
+        },
+    }
+}
+
+/// Adds references that live on someone else's server.
+///
+/// Only the thumbnail is fetched and stored. The palette comes off that
+/// thumbnail, so colour search covers linked references exactly as it covers
+/// downloaded ones -- which is the point of holding a thumbnail rather than
+/// just a URL.
+pub fn import_links(
+    lib: &Library,
+    conn: &mut Connection,
+    links: Vec<PendingLink>,
+) -> Result<ImportReport> {
+    let mut report = ImportReport::default();
+    if links.is_empty() {
+        return Ok(report);
+    }
+
+    // Prepared outside the transaction: decoding and encoding a thumbnail is
+    // slow enough that holding a write lock across it would block the grid.
+    struct Ready {
+        link: PendingLink,
+        hash: String,
+        ext: String,
+        width: u32,
+        height: u32,
+        swatches: Vec<Swatch>,
+    }
+
+    let mut ready: Vec<Ready> = Vec::with_capacity(links.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    {
+        let mut exists = conn.prepare("SELECT 1 FROM assets WHERE remote_url = ?1")?;
+        for link in links {
+            // Same URL twice in one batch, or already in the library.
+            let already = !seen.insert(link.media_url.clone())
+                || exists.exists(rusqlite::params![&link.media_url])?;
+            if already {
+                report.duplicates += 1;
+                continue;
+            }
+
+            let hash = link_hash(&link.media_url);
+            match prepare_link_thumbnail(lib, &hash, &link) {
+                Ok((width, height, swatches)) => ready.push(Ready {
+                    ext: ext_from_url(&link.media_url, link.kind),
+                    link,
+                    hash,
+                    width,
+                    height,
+                    swatches,
+                }),
+                Err(e) => report.failed.push(FailedImport {
+                    path: link.page_url.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        }
+    }
+
+    let imported_at = now_unix();
+    let tx = conn.transaction()?;
+    for r in &ready {
+        let mime = match r.link.kind {
+            MediaKind::Video => video_mime(&r.ext).to_string(),
+            MediaKind::Image => image_ops::mime_for_extension(&r.ext).to_string(),
+        };
+
+        tx.execute(
+            "INSERT INTO assets
+                (hash, kind, duration_ms, ext, mime, width, height, bytes,
+                 original_name, source_url, imported_at, state, remote_url)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
+            rusqlite::params![
+                r.hash,
+                r.link.kind.as_str(),
+                r.ext,
+                mime,
+                r.width,
+                r.height,
+                r.link.title,
+                r.link.page_url,
+                imported_at,
+                // Bound rather than written into the SQL so the column can only
+                // ever hold a value the enum can read back.
+                AssetState::Linked.as_str(),
+                r.link.media_url,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+
+        for (ordinal, s) in r.swatches.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO swatches (asset_id, ordinal, weight, l, a, b, hex)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![id, ordinal as i64, s.weight, s.l, s.a, s.b, s.hex],
+            )?;
+        }
+
+        report.imported.push(AssetRow {
+            id,
+            hash: r.hash.clone(),
+            kind: r.link.kind,
+            state: AssetState::Linked,
+            duration_ms: None,
+            ext: r.ext.clone(),
+            mime,
+            width: r.width,
+            height: r.height,
+            bytes: 0,
+            original_name: r.link.title.clone(),
+            source_url: Some(r.link.page_url.clone()),
+            remote_url: Some(r.link.media_url.clone()),
+            imported_at,
+            swatches: r.swatches.clone(),
+            thumb_path: lib.thumb_path(&r.hash).display().to_string(),
+            blob_path: lib.blob_path(&r.hash, &r.ext).display().to_string(),
+        });
+    }
+    tx.commit()?;
+
+    Ok(report)
+}
+
+/// Decodes the fetched still, stores it as this reference's thumbnail, and
+/// reads its palette. Returns the dimensions the tile should claim.
+fn prepare_link_thumbnail(
+    lib: &Library,
+    hash: &str,
+    link: &PendingLink,
+) -> Result<(u32, u32, Vec<Swatch>)> {
+    let path = Path::new(&link.page_url);
+    let image = image_ops::decode(path, &link.thumbnail)?;
+
+    let thumb = image_ops::encode_webp(&image_ops::thumbnail(&image, THUMB_LONG_EDGE))?;
+    lib.write_if_absent(&lib.thumb_path(hash), &thumb)?;
+
+    let swatches = palette_from_pixels(&image_ops::palette_samples(&image), PALETTE_SIZE);
+    // The poster's dimensions, not the media's -- nothing here has read the
+    // media. They share an aspect ratio, which is all the grid needs, and the
+    // real numbers land on the row when the file is eventually downloaded.
+    Ok((image.width(), image.height(), swatches))
+}
+
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DownloadReport {
+    /// Rows that now hold real bytes.
+    pub downloaded: Vec<AssetRow>,
+    /// Links whose content turned out to already be in the library. The link
+    /// row is gone and its board memberships moved to the asset that has the
+    /// bytes; nothing was lost.
+    pub deduplicated: usize,
+    pub bytes_written: i64,
+    pub failed: Vec<FailedImport>,
+}
+
+/// Fetches the bytes behind linked references and turns them into local ones.
+///
+/// `fetch` does the transfer, so the caller decides which HTTP client applies:
+/// X media needs the authenticated client, anything else must go through the
+/// cookieless one. Keeping that choice out here is what stops session cookies
+/// reaching an arbitrary host.
+pub fn download_assets(
+    lib: &Library,
+    conn: &mut Connection,
+    asset_ids: &[i64],
+    mut fetch: impl FnMut(&str, &Path) -> Result<u64>,
+    mut progress: impl FnMut(i64, usize, usize),
+) -> Result<DownloadReport> {
+    let mut report = DownloadReport::default();
+    if asset_ids.is_empty() {
+        return Ok(report);
+    }
+
+    // Read the whole worklist up front so the connection is free during the
+    // transfers, which are the slow part by orders of magnitude.
+    let mut pending: Vec<(i64, String, String, String, MediaKind)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT hash, remote_url, ext, kind FROM assets
+             WHERE id = ?1 AND state = 'linked' AND remote_url IS NOT NULL",
+        )?;
+        for id in asset_ids {
+            let mut rows = stmt.query([id])?;
+            if let Some(r) = rows.next()? {
+                pending.push((
+                    *id,
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    MediaKind::from_str(&r.get::<_, String>(3)?),
+                ));
+            }
+        }
+    }
+
+    let total = pending.len();
+    for (n, (id, hash, remote_url, ext, _kind)) in pending.into_iter().enumerate() {
+        progress(id, n + 1, total);
+        match materialize(lib, conn, id, &hash, &remote_url, &ext, &mut fetch) {
+            Ok(Materialized::Downloaded(row, bytes)) => {
+                report.bytes_written += bytes;
+                report.downloaded.push(*row);
+            }
+            Ok(Materialized::AlreadyHeld) => report.deduplicated += 1,
+            Err(e) => report.failed.push(FailedImport {
+                path: remote_url.clone(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+    Ok(report)
+}
+
+enum Materialized {
+    Downloaded(Box<AssetRow>, i64),
+    AlreadyHeld,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn materialize(
+    lib: &Library,
+    conn: &mut Connection,
+    id: i64,
+    hash: &str,
+    remote_url: &str,
+    ext: &str,
+    fetch: &mut impl FnMut(&str, &Path) -> Result<u64>,
+) -> Result<Materialized> {
+    // Downloaded beside the destination rather than into %TEMP%: a rename
+    // within one volume is atomic and instant, while a cross-volume move is a
+    // second full copy of a file that may be hundreds of megabytes.
+    let dest = lib.blob_path(hash, ext);
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::io(parent, e))?;
+    }
+    let staging = dest.with_extension("downloading");
+    let _guard = CleanupOnDrop(&staging);
+
+    fetch(remote_url, &staging)?;
+
+    let content_hash = store::hash_file(&staging)?;
+
+    // The bytes may already be here under a different reference -- the same
+    // video dragged in from disk, or linked twice from different posts.
+    let existing: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM assets WHERE content_hash = ?1 AND id <> ?2 AND state = 'local'",
+            rusqlite::params![&content_hash, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    if let Some(keeper) = existing {
+        // Hand the link's board memberships to the copy that has the bytes, so
+        // deduplicating never silently empties a board.
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT OR IGNORE INTO board_items (board_id, asset_id, added_at)
+             SELECT board_id, ?1, added_at FROM board_items WHERE asset_id = ?2",
+            rusqlite::params![keeper, id],
+        )?;
+        tx.execute("DELETE FROM assets WHERE id = ?1", [id])?;
+        tx.commit()?;
+        let _ = std::fs::remove_file(lib.thumb_path(hash));
+        return Ok(Materialized::AlreadyHeld);
+    }
+
+    // Now that the bytes are known-wanted, read what they actually are. The
+    // link's stored width/height came from a poster and the duration was
+    // unknown; both get corrected here.
+    let found = describe_downloaded(&staging)?;
+    let size = std::fs::metadata(&staging)
+        .map(|m| m.len() as i64)
+        .map_err(|e| Error::io(&staging, e))?;
+
+    // The link's thumbnail came from a publisher's poster; this one comes from
+    // the media, so replace rather than skip if one is already there.
+    let thumb_path = lib.thumb_path(hash);
+    let _ = std::fs::remove_file(&thumb_path);
+    lib.write_if_absent(&thumb_path, &found.thumb)?;
+    // Rename last: until this succeeds the row still says 'linked' and the
+    // reference still streams, so a failure here costs a retry, not a tile.
+    std::fs::rename(&staging, &dest).map_err(|e| Error::io(&dest, e))?;
+
+    conn.execute(
+        "UPDATE assets
+            SET state = ?1, content_hash = ?2, bytes = ?3, width = ?4,
+                height = ?5, duration_ms = ?6, kind = ?7, remote_url = NULL
+          WHERE id = ?8",
+        rusqlite::params![
+            AssetState::Local.as_str(),
+            content_hash,
+            size,
+            found.width,
+            found.height,
+            found.duration_ms,
+            found.kind.as_str(),
+            id
+        ],
+    )?;
+
+    let mut row = conn.query_row(&format!("{ASSET_COLUMNS} WHERE id = ?1"), [id], |r| {
+        row_to_asset(lib, r)
+    })?;
+    row.swatches = swatches_for(conn, id)?;
+    Ok(Materialized::Downloaded(Box::new(row), size))
+}
+
+/// Removes a staging file unless it was renamed away.
+///
+/// A failed or cancelled download must not leave a half-written file sitting
+/// next to the blob it was going to become.
+struct CleanupOnDrop<'a>(&'a Path);
+
+impl Drop for CleanupOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = std::fs::remove_file(self.0);
+        }
+    }
+}
+
+/// What a downloaded file turned out to be.
+struct Downloaded {
+    width: u32,
+    height: u32,
+    duration_ms: Option<i64>,
+    /// Encoded WebP thumbnail, regenerated from the real media.
+    thumb: Vec<u8>,
+    kind: MediaKind,
+}
+
+/// Reads a freshly downloaded file: real dimensions, duration, and a thumbnail
+/// generated from the media itself rather than from whatever poster the source
+/// published.
+///
+/// The kind recorded when the link was added is not passed in on purpose. It
+/// was a guess made from a URL and a content type; the file now on disk is
+/// authoritative, and preferring the guess would be how a video ends up stored
+/// as an image that will not play.
+fn describe_downloaded(path: &Path) -> Result<Downloaded> {
+    let header = store::read_header(path, HEADER_SNIFF_BYTES)?;
+
+    // Trust the file over the expectation: a URL that looked like a video can
+    // serve an image, and storing it as the wrong kind breaks playback.
+    if image_ops::format_of(&header).is_some() {
+        let bytes = std::fs::read(path).map_err(|e| Error::io(path, e))?;
+        let image = image_ops::decode(path, &bytes)?;
+        let thumb = image_ops::encode_webp(&image_ops::thumbnail(&image, THUMB_LONG_EDGE))?;
+        return Ok(Downloaded {
+            width: image.width(),
+            height: image.height(),
+            duration_ms: None,
+            thumb,
+            kind: MediaKind::Image,
+        });
+    }
+
+    if let Some(info) = video::probe(path)? {
+        let frame_png = video::extract_poster_frame(path, info.duration_ms)?;
+        let frame = image_ops::decode(path, &frame_png)?;
+        let thumb = image_ops::encode_webp(&image_ops::thumbnail(&frame, THUMB_LONG_EDGE))?;
+        return Ok(Downloaded {
+            // Dimensions come from the stream, not the decoded frame: ffmpeg
+            // may hand back square pixels where the stream is anamorphic.
+            width: if info.width > 0 {
+                info.width
+            } else {
+                frame.width()
+            },
+            height: if info.height > 0 {
+                info.height
+            } else {
+                frame.height()
+            },
+            duration_ms: Some(info.duration_ms),
+            thumb,
+            kind: MediaKind::Video,
+        });
+    }
+
+    Err(Error::Link(format!(
+        "downloaded {} bytes that are neither an image nor a video -- the link \
+         probably served an error page",
+        std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+    )))
+}
+
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct DeleteReport {
@@ -516,35 +991,11 @@ pub fn list_assets(
     limit: i64,
     offset: i64,
 ) -> Result<Vec<AssetRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
-                original_name, source_url, imported_at
-         FROM assets ORDER BY imported_at DESC, id DESC LIMIT ?1 OFFSET ?2",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "{ASSET_COLUMNS} ORDER BY imported_at DESC, id DESC LIMIT ?1 OFFSET ?2"
+    ))?;
     let rows = stmt
-        .query_map(rusqlite::params![limit, offset], |r| {
-            let hash: String = r.get(1)?;
-            Ok(AssetRow {
-                id: r.get(0)?,
-                thumb_path: lib.thumb_path(&hash).display().to_string(),
-                blob_path: lib
-                    .blob_path(&hash, &r.get::<_, String>(4)?)
-                    .display()
-                    .to_string(),
-                hash,
-                kind: MediaKind::from_str(&r.get::<_, String>(2)?),
-                duration_ms: r.get(3)?,
-                ext: r.get(4)?,
-                mime: r.get(5)?,
-                width: r.get(6)?,
-                height: r.get(7)?,
-                bytes: r.get(8)?,
-                original_name: r.get(9)?,
-                source_url: r.get(10)?,
-                imported_at: r.get(11)?,
-                swatches: Vec::new(),
-            })
-        })?
+        .query_map(rusqlite::params![limit, offset], |r| row_to_asset(lib, r))?
         .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let mut out = rows;
@@ -552,6 +1003,37 @@ pub fn list_assets(
         asset.swatches = swatches_for(conn, asset.id)?;
     }
     Ok(out)
+}
+
+/// Column list every asset query selects, so `row_to_asset` can read them all
+/// positionally. Kept in one place because the indices below depend on it.
+pub(crate) const ASSET_COLUMNS: &str =
+    "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
+            original_name, source_url, imported_at, state, remote_url
+     FROM assets";
+
+pub(crate) fn row_to_asset(lib: &Library, r: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
+    let hash: String = r.get(1)?;
+    let ext: String = r.get(4)?;
+    Ok(AssetRow {
+        id: r.get(0)?,
+        thumb_path: lib.thumb_path(&hash).display().to_string(),
+        blob_path: lib.blob_path(&hash, &ext).display().to_string(),
+        hash,
+        kind: MediaKind::from_str(&r.get::<_, String>(2)?),
+        duration_ms: r.get(3)?,
+        ext,
+        mime: r.get(5)?,
+        width: r.get(6)?,
+        height: r.get(7)?,
+        bytes: r.get(8)?,
+        original_name: r.get(9)?,
+        source_url: r.get(10)?,
+        imported_at: r.get(11)?,
+        state: AssetState::from_str(&r.get::<_, String>(12)?),
+        remote_url: r.get(13)?,
+        swatches: Vec::new(),
+    })
 }
 
 fn swatches_for(conn: &Connection, asset_id: i64) -> Result<Vec<Swatch>> {
@@ -650,36 +1132,12 @@ pub fn search_by_color(
 }
 
 pub(crate) fn asset_by_id(lib: &Library, conn: &Connection, id: i64) -> Result<Option<AssetRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
-                original_name, source_url, imported_at
-         FROM assets WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!("{ASSET_COLUMNS} WHERE id = ?1"))?;
     let mut rows = stmt.query([id])?;
     let Some(r) = rows.next()? else {
         return Ok(None);
     };
-    let hash: String = r.get(1)?;
-    let mut asset = AssetRow {
-        id: r.get(0)?,
-        thumb_path: lib.thumb_path(&hash).display().to_string(),
-        blob_path: lib
-            .blob_path(&hash, &r.get::<_, String>(4)?)
-            .display()
-            .to_string(),
-        hash,
-        kind: MediaKind::from_str(&r.get::<_, String>(2)?),
-        duration_ms: r.get(3)?,
-        ext: r.get(4)?,
-        mime: r.get(5)?,
-        width: r.get(6)?,
-        height: r.get(7)?,
-        bytes: r.get(8)?,
-        original_name: r.get(9)?,
-        source_url: r.get(10)?,
-        imported_at: r.get(11)?,
-        swatches: Vec::new(),
-    };
+    let mut asset = row_to_asset(lib, r)?;
     drop(rows);
     asset.swatches = swatches_for(conn, id)?;
     Ok(Some(asset))
@@ -724,6 +1182,365 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// Encodes a solid-colour PNG in memory, standing in for a fetched poster.
+    fn png_bytes(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgba8(RgbaImage::from_pixel(w, h, Rgba(rgba)));
+        let mut buf = std::io::Cursor::new(Vec::new());
+        image
+            .write_to(&mut buf, image::ImageFormat::Png)
+            .expect("encode");
+        buf.into_inner()
+    }
+
+    fn pending(media_url: &str, kind: MediaKind, rgba: [u8; 4]) -> PendingLink {
+        PendingLink {
+            page_url: "https://x.com/someone/status/1".into(),
+            media_url: media_url.into(),
+            kind,
+            title: Some("a reference".into()),
+            thumbnail: png_bytes(64, 36, rgba),
+        }
+    }
+
+    #[test]
+    fn a_local_import_records_its_content_hash() {
+        // The v4 backfill only reached rows that already existed, so every new
+        // insert has to write content_hash itself. Without it, downloading a
+        // link can never recognise bytes the library already holds.
+        let mut fx = Fixture::new("content-hash");
+        let path = fx.write_png("a.png", 8, 8, [1, 2, 3, 255]);
+        let report = import_paths(&fx.lib, &mut fx.conn, &[path]).expect("import");
+
+        let hash = &report.imported[0].hash;
+        let stored: Option<String> = fx
+            .conn
+            .query_row(
+                "SELECT content_hash FROM assets WHERE hash = ?1",
+                [hash],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_ref(), Some(hash));
+    }
+
+    #[test]
+    fn a_link_is_stored_as_a_thumbnail_and_a_url_with_no_blob() {
+        let mut fx = Fixture::new("link-basic");
+        let url = "https://video.twimg.com/clip.mp4";
+        let report = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(url, MediaKind::Video, [10, 200, 90, 255])],
+        )
+        .expect("import link");
+
+        assert_eq!(report.imported.len(), 1);
+        let a = &report.imported[0];
+        assert_eq!(a.state, AssetState::Linked);
+        assert_eq!(a.remote_url.as_deref(), Some(url));
+        assert_eq!(
+            a.bytes, 0,
+            "a link stores no media, and should not claim to"
+        );
+        assert_eq!(a.duration_ms, None, "nothing has read the file yet");
+
+        // The thumbnail is real and on disk; the blob deliberately is not.
+        assert!(Path::new(&a.thumb_path).is_file(), "no thumbnail written");
+        assert!(
+            !Path::new(&a.blob_path).exists(),
+            "a link must not create a blob"
+        );
+
+        // The palette is what makes colour search cover linked references, so
+        // its absence would be a silent feature regression.
+        assert!(
+            !a.swatches.is_empty(),
+            "no palette extracted from the poster"
+        );
+    }
+
+    #[test]
+    fn the_same_link_twice_is_a_duplicate_not_a_second_tile() {
+        let mut fx = Fixture::new("link-dupe");
+        let url = "https://video.twimg.com/same.mp4";
+
+        // Once in a single batch...
+        let report = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![
+                pending(url, MediaKind::Video, [1, 2, 3, 255]),
+                pending(url, MediaKind::Video, [1, 2, 3, 255]),
+            ],
+        )
+        .expect("import");
+        assert_eq!(report.imported.len(), 1);
+        assert_eq!(report.duplicates, 1);
+
+        // ...and again against what is already committed.
+        let again = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(url, MediaKind::Video, [1, 2, 3, 255])],
+        )
+        .expect("import");
+        assert!(again.imported.is_empty());
+        assert_eq!(again.duplicates, 1);
+    }
+
+    #[test]
+    fn colour_search_reaches_linked_references() {
+        // The reason a link stores a thumbnail at all rather than just a URL.
+        let mut fx = Fixture::new("link-colour");
+        import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/green.mp4",
+                MediaKind::Video,
+                [20, 200, 60, 255],
+            )],
+        )
+        .expect("import");
+
+        let hits = search_by_color(&fx.lib, &fx.conn, "#14c83c", 0.12, 10).expect("search");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a linked reference did not match its own colour"
+        );
+        assert_eq!(hits[0].asset.state, AssetState::Linked);
+    }
+
+    #[test]
+    fn downloading_a_link_makes_it_local_with_real_metadata() {
+        let Some(source) = write_video(&Fixture::new("probe").dir.clone(), "src.mp4", 3) else {
+            eprintln!("ffmpeg unavailable; skipping");
+            return;
+        };
+        let mut fx = Fixture::new("link-download");
+        let real = fx.dir.join("real.mp4");
+        std::fs::copy(&source, &real).expect("stage source");
+        let _ = std::fs::remove_file(&source);
+
+        let report = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/real.mp4",
+                MediaKind::Video,
+                [90, 90, 90, 255],
+            )],
+        )
+        .expect("import link");
+        let id = report.imported[0].id;
+
+        // Stands in for the network: copies the staged file into place.
+        let done = download_assets(
+            &fx.lib,
+            &mut fx.conn,
+            &[id],
+            |_url, dest| std::fs::copy(&real, dest).map_err(|e| Error::io(dest, e)),
+            |_, _, _| {},
+        )
+        .expect("download");
+
+        assert_eq!(done.failed.len(), 0, "{:?}", done.failed);
+        assert_eq!(done.downloaded.len(), 1);
+        let a = &done.downloaded[0];
+        assert_eq!(a.state, AssetState::Local);
+        assert!(Path::new(&a.blob_path).is_file(), "blob was not written");
+        assert!(a.bytes > 0, "size still reads as a link's zero");
+        assert!(
+            a.duration_ms.unwrap_or(0) > 0,
+            "duration should be known once the file is real"
+        );
+        assert_eq!(
+            a.remote_url, None,
+            "a downloaded reference should stop advertising a remote source"
+        );
+
+        // No staging file left beside the blob.
+        assert!(!Path::new(&a.blob_path)
+            .with_extension("downloading")
+            .exists());
+    }
+
+    #[test]
+    fn downloading_bytes_the_library_already_holds_dedupes_and_keeps_the_board() {
+        let fx0 = Fixture::new("dedupe-src");
+        let Some(source) = write_video(&fx0.dir.clone(), "src.mp4", 3) else {
+            eprintln!("ffmpeg unavailable; skipping");
+            return;
+        };
+        let mut fx = Fixture::new("link-dedupe");
+        let real = fx.dir.join("real.mp4");
+        std::fs::copy(&source, &real).expect("stage");
+
+        // Already in the library the ordinary way.
+        let local =
+            import_paths(&fx.lib, &mut fx.conn, std::slice::from_ref(&real)).expect("import");
+        let local_id = local.imported[0].id;
+
+        // The same footage arrives again as a link, and gets put on a board.
+        let linked = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/same-footage.mp4",
+                MediaKind::Video,
+                [5, 5, 5, 255],
+            )],
+        )
+        .expect("import link");
+        let link_id = linked.imported[0].id;
+
+        let board = crate::boards::create_board(&fx.conn, "Refs").expect("board");
+        crate::boards::add_to_board(&mut fx.conn, board.id, &[link_id]).expect("add");
+
+        let done = download_assets(
+            &fx.lib,
+            &mut fx.conn,
+            &[link_id],
+            |_url, dest| std::fs::copy(&real, dest).map_err(|e| Error::io(dest, e)),
+            |_, _, _| {},
+        )
+        .expect("download");
+
+        assert_eq!(done.deduplicated, 1, "identical bytes imported twice");
+        assert!(done.downloaded.is_empty());
+
+        // The link row is gone...
+        let still: i64 = fx
+            .conn
+            .query_row(
+                "SELECT count(*) FROM assets WHERE id = ?1",
+                [link_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, 0);
+
+        // ...and the board points at the copy that has the bytes, rather than
+        // having quietly lost its item.
+        let on_board: Vec<i64> = fx
+            .conn
+            .prepare("SELECT asset_id FROM board_items WHERE board_id = ?1")
+            .unwrap()
+            .query_map([board.id], |r| r.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            on_board,
+            vec![local_id],
+            "board membership was not transferred"
+        );
+    }
+
+    #[test]
+    fn a_failed_download_leaves_the_reference_linked_and_no_debris() {
+        let mut fx = Fixture::new("link-fail");
+        let report = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/gone.mp4",
+                MediaKind::Video,
+                [7, 7, 7, 255],
+            )],
+        )
+        .expect("import link");
+        let id = report.imported[0].id;
+
+        let done = download_assets(
+            &fx.lib,
+            &mut fx.conn,
+            &[id],
+            |_url, dest| {
+                // Write something, then fail: the half-written file must not
+                // survive to be mistaken for a blob.
+                std::fs::write(dest, b"partial").ok();
+                Err(Error::Link("host is unreachable".into()))
+            },
+            |_, _, _| {},
+        )
+        .expect("download");
+
+        assert_eq!(done.failed.len(), 1);
+        assert_eq!(done.downloaded.len(), 0);
+
+        let state: String = fx
+            .conn
+            .query_row("SELECT state FROM assets WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert_eq!(state, "linked", "a failed download must not orphan the row");
+
+        let blob = fx.lib.blob_path(&report.imported[0].hash, "mp4");
+        assert!(!blob.exists());
+        assert!(
+            !blob.with_extension("downloading").exists(),
+            "a partial download was left behind"
+        );
+    }
+
+    #[test]
+    fn a_link_that_serves_an_error_page_is_reported_not_stored() {
+        let mut fx = Fixture::new("link-html");
+        let report = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(
+                "https://video.twimg.com/nope.mp4",
+                MediaKind::Video,
+                [9, 9, 9, 255],
+            )],
+        )
+        .expect("import link");
+        let id = report.imported[0].id;
+
+        let done = download_assets(
+            &fx.lib,
+            &mut fx.conn,
+            &[id],
+            |_url, dest| {
+                std::fs::write(dest, b"<html><body>404</body></html>")
+                    .map(|_| 29u64)
+                    .map_err(|e| Error::io(dest, e))
+            },
+            |_, _, _| {},
+        )
+        .expect("download");
+
+        assert_eq!(done.downloaded.len(), 0);
+        assert_eq!(done.failed.len(), 1);
+        assert!(
+            done.failed[0]
+                .reason
+                .contains("neither an image nor a video"),
+            "unhelpful message: {}",
+            done.failed[0].reason
+        );
+    }
+
+    #[test]
+    fn extensions_come_from_the_url_and_fall_back_by_kind() {
+        assert_eq!(
+            ext_from_url("https://a/b/c.mp4?tag=29", MediaKind::Video),
+            "mp4"
+        );
+        assert_eq!(ext_from_url("https://a/b/c.WEBM", MediaKind::Video), "webm");
+        assert_eq!(ext_from_url("https://a/b/c.png", MediaKind::Image), "png");
+        // A player page or extensionless CDN path is normal, not an error.
+        assert_eq!(
+            ext_from_url("https://youtube.com/watch?v=x", MediaKind::Video),
+            "mp4"
+        );
+        assert_eq!(ext_from_url("https://a/image", MediaKind::Image), "jpg");
+        // An extension that does not match the kind must not be believed.
+        assert_eq!(ext_from_url("https://a/page.html", MediaKind::Video), "mp4");
     }
 
     #[test]

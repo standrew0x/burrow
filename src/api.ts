@@ -5,6 +5,7 @@ import type {
   Board,
   ColorMatch,
   DeleteReport,
+  DownloadReport,
   ImportReport,
   SyncOptions,
   SyncReport,
@@ -34,6 +35,22 @@ export const thumbUrl = (asset: Asset) => convertFileSrc(asset.thumbPath);
 
 /** Playable URL for a stored video original. Same scope caveat as thumbUrl. */
 export const blobUrl = (asset: Asset) => convertFileSrc(asset.blobPath);
+
+/**
+ * Where to play this reference from.
+ *
+ * A linked reference streams from the host that holds it; a local one plays off
+ * disk. The remote case is why `media-src` in tauri.conf.json carries `https:`
+ * — a remote video cannot play without its origin being allowed, and the set of
+ * origins is whatever the user pastes or bookmarks, so it cannot be listed
+ * ahead of time.
+ *
+ * `img-src` is deliberately NOT widened to match. Thumbnails are fetched once
+ * at import and cached locally, so browsing the grid contacts nobody; only
+ * pressing play on a linked video reveals an IP address to its host.
+ */
+export const playbackUrl = (asset: Asset) =>
+  asset.state === "linked" ? asset.remoteUrl : blobUrl(asset);
 
 /**
  * WebView2 plays mp4 and webm; everything else is stored and openable but will
@@ -71,6 +88,17 @@ export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number
 /** Permanent: removes the rows and unlinks the stored files. */
 export const deleteAssets = (assetIds: number[]) =>
   invoke<DeleteReport>("delete_assets", { assetIds });
+
+/**
+ * Adds references from pasted URLs. Only a preview image is fetched; the media
+ * stays on its host until downloaded.
+ */
+export const addLinks = (urls: string[]) =>
+  invoke<ImportReport>("add_links", { urls });
+
+/** Fetches the media behind linked references, making them local. */
+export const downloadAssets = (assetIds: number[]) =>
+  invoke<DownloadReport>("download_assets", { assetIds });
 
 /** Pulls images and videos from X bookmarks. */
 export const syncFromX = (opts: SyncOptions) =>

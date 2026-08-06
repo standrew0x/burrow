@@ -31,6 +31,12 @@ pub enum Error {
     #[error("{0}")]
     X(String),
 
+    /// Anything wrong with a pasted URL: malformed, unreachable, refused as
+    /// private, or served without a preview image. Surfaced to the user
+    /// verbatim, so the messages read as explanations rather than codes.
+    #[error("{0}")]
+    Link(String),
+
     #[error("no library directory available on this platform")]
     NoLibraryDir,
 

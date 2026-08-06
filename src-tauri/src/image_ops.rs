@@ -55,6 +55,26 @@ pub fn format_of(bytes: &[u8]) -> Option<(&'static str, &'static str)> {
     })
 }
 
+/// MIME type for a container extension.
+///
+/// The extension-driven counterpart to [`format_of`], for the case where the
+/// bytes are not in hand: a linked image is described by its URL, and the only
+/// thing downloaded is a thumbnail that may be in a different format entirely.
+pub fn mime_for_extension(ext: &str) -> &'static str {
+    match ext {
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        "avif" => "image/avif",
+        "bmp" => "image/bmp",
+        "tif" | "tiff" => "image/tiff",
+        "ico" => "image/x-icon",
+        // Including "jpg"/"jpeg". Guessing jpeg for an unknown extension beats
+        // inventing a type: it is what CDNs serve when they say nothing.
+        _ => "image/jpeg",
+    }
+}
+
 /// Scales so the long edge is at most `long_edge`, preserving aspect ratio.
 /// Images already smaller are returned untouched rather than upscaled.
 pub fn thumbnail(image: &DynamicImage, long_edge: u32) -> DynamicImage {

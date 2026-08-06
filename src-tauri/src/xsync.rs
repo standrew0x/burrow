@@ -235,12 +235,25 @@ impl XClient {
             .map(|c| (c[1].to_string(), c[2].to_string()))
             .collect();
 
-        // Shared chunks first: they carry several operations at once, so the
-        // common case resolves everything in one fetch.
+        // Which chunks are worth fetching.
+        //
+        // This used to be `n.contains("Bookmark")`, which quietly meant only
+        // bookmark operations were ever discoverable -- asking for anything
+        // else scanned no chunks at all and reported "X changed its frontend",
+        // which is a misleading way to say "we never looked". The keywords now
+        // come from the operations requested.
+        let keywords = chunk_keywords(operations);
         let mut candidates: Vec<&(String, String)> = names
             .iter()
-            .filter(|(_, n)| n.contains("Bookmark"))
+            .filter(|(_, n)| {
+                let lower = n.to_ascii_lowercase();
+                // Shared chunks carry many operations and are named for none of
+                // them, so they have to be included on faith.
+                lower.contains("shared") || keywords.iter().any(|k| lower.contains(k))
+            })
             .collect();
+        // Shared chunks first: they carry several operations at once, so the
+        // common case resolves everything in one fetch.
         candidates.sort_by_key(|(_, n)| !n.contains("shared"));
 
         // Compiled once, not per chunk per operation: regex construction is far
@@ -397,6 +410,42 @@ impl XClient {
             .collect())
     }
 
+    /// Media attached to one post, by id.
+    ///
+    /// Backs pasting a link to a single post. Discovery runs per call rather
+    /// than being cached alongside the bookmark specs: pasting a link is a
+    /// one-off, and a stale query id fails the whole request with a message
+    /// about GraphQL that means nothing to the person who pasted a URL.
+    pub fn tweet_media(&self, status_id: &str) -> Result<Vec<BookmarkMedia>> {
+        if status_id.is_empty() || !status_id.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(Error::X(format!("{status_id:?} is not a post id")));
+        }
+        let specs = self
+            .discover(&["TweetResultByRestId"])
+            .map_err(|e| Error::X(e.to_string()))?;
+        let spec = specs
+            .first()
+            .ok_or_else(|| Error::X("could not locate the post lookup API".into()))?;
+
+        let data = self
+            .graphql(
+                spec,
+                "TweetResultByRestId",
+                serde_json::json!({
+                    "tweetId": status_id,
+                    "includePromotedContent": false,
+                    "withCommunity": false,
+                    "withVoice": false,
+                }),
+            )
+            .map_err(|e| Error::X(e.to_string()))?;
+
+        let result = data
+            .pointer("/tweetResult/result")
+            .ok_or_else(|| Error::X(format!("post {status_id} is unavailable or protected")))?;
+        Ok(media_from_tweet(result))
+    }
+
     /// Images and videos from bookmarks, newest first.
     ///
     /// The timeline is strictly newest-first, which makes the date window
@@ -484,27 +533,151 @@ impl XClient {
     /// Named by tweet id plus position, so the four photos of a single post do
     /// not overwrite each other.
     pub fn download(&self, item: &BookmarkMedia, dir: &Path) -> Result<PathBuf> {
-        let dest = dir.join(format!("x_{}_{}.{}", item.tweet_id, item.index, item.ext));
+        let stem = item.safe_stem().ok_or_else(|| {
+            Error::X(format!(
+                "refusing to save {}: tweet id {:?} is not a decimal id",
+                item.tweet_url, item.tweet_id
+            ))
+        })?;
+        let dest = dir.join(format!("{stem}.{}", item.ext));
+        self.stream_to(&item.media_url, &dest)?;
+        Ok(dest)
+    }
+
+    /// Fetches the still image for an item -- poster frame, or the photo itself.
+    pub fn fetch_thumbnail(&self, item: &BookmarkMedia) -> Result<Vec<u8>> {
+        self.get_bytes(item.thumbnail_source())
+    }
+
+    /// GETs a twimg URL into memory. Only for thumbnails, which are ~100KB.
+    pub fn get_bytes(&self, url: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+
+        if !is_twimg_host(url) {
+            return Err(Error::X(format!("refusing to fetch off-network URL {url}")));
+        }
         let mut resp = self
             .http
-            .get(&item.media_url)
+            .get(url)
             .send()
-            .map_err(|e| Error::X(format!("downloading {}: {e}", item.tweet_url)))?;
+            .map_err(|e| Error::X(format!("fetching {url}: {e}")))?;
         if !resp.status().is_success() {
             return Err(Error::X(format!(
-                "downloading {} returned HTTP {}",
-                item.tweet_url,
+                "fetching {url} returned HTTP {}",
                 resp.status().as_u16()
             )));
         }
-        let mut file = std::fs::File::create(&dest).map_err(|e| Error::io(&dest, e))?;
+        // Capped even though posters are small: the size is the server's claim,
+        // not ours, and this one lands on the heap.
+        const MAX_THUMB_BYTES: u64 = 32 * 1024 * 1024;
+        let mut buf = Vec::new();
+        resp.by_ref()
+            .take(MAX_THUMB_BYTES)
+            .read_to_end(&mut buf)
+            .map_err(|e| Error::X(format!("reading {url}: {e}")))?;
+        Ok(buf)
+    }
+
+    /// Advertised size of a media URL, without fetching the body.
+    ///
+    /// Used to show what a download will cost before committing to it. Returns
+    /// `None` when the server declines to say, which is not an error.
+    pub fn head_length(&self, url: &str) -> Result<Option<u64>> {
+        if !is_twimg_host(url) {
+            return Err(Error::X(format!("refusing to probe off-network URL {url}")));
+        }
+        let resp = self
+            .http
+            .head(url)
+            .send()
+            .map_err(|e| Error::X(format!("sizing {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::X(format!(
+                "sizing {url} returned HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        Ok(resp.content_length())
+    }
+
+    /// Streams `url` to `dest`, refusing anything off-network or oversized.
+    pub fn stream_to(&self, url: &str, dest: &Path) -> Result<u64> {
+        use std::io::Read;
+
+        if !is_twimg_host(url) {
+            return Err(Error::X(format!(
+                "refusing to download off-network URL {url}"
+            )));
+        }
+        let mut resp = self
+            .http
+            .get(url)
+            .send()
+            .map_err(|e| Error::X(format!("downloading {url}: {e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::X(format!(
+                "downloading {url} returned HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+
+        // Trust the advertised length only to fail early; the read below is
+        // what actually enforces the cap, since Content-Length can lie.
+        if let Some(len) = resp.content_length() {
+            if len > MAX_DOWNLOAD_BYTES {
+                return Err(Error::X(format!(
+                    "refusing {url}: {len} bytes exceeds the {MAX_DOWNLOAD_BYTES} byte cap"
+                )));
+            }
+        }
+
+        let mut file = std::fs::File::create(dest).map_err(|e| Error::io(dest, e))?;
         // Streamed, not buffered: videos run to 150MB.
-        std::io::copy(&mut resp, &mut file).map_err(|e| Error::io(&dest, e))?;
-        Ok(dest)
+        let written = std::io::copy(&mut resp.by_ref().take(MAX_DOWNLOAD_BYTES), &mut file)
+            .map_err(|e| Error::io(dest, e))?;
+
+        if written == MAX_DOWNLOAD_BYTES {
+            // Hit the ceiling exactly, so the body was almost certainly still
+            // going. A truncated video is worse than no video: it would import
+            // cleanly and only reveal itself on playback.
+            let _ = std::fs::remove_file(dest);
+            return Err(Error::X(format!(
+                "{url} exceeded the {MAX_DOWNLOAD_BYTES} byte cap"
+            )));
+        }
+        Ok(written)
     }
 }
 
 // --- parsing helpers ---
+
+/// Lowercase chunk-name fragments likely to contain the given operations.
+///
+/// Chunk names track the feature rather than the exact operation --
+/// `TweetResultByRestId` lives in a chunk named for `Tweet`, not for the whole
+/// identifier -- so the leading CamelCase word is the part worth matching. It is
+/// truncated because plurals differ between the two: the `Bookmarks` operation
+/// sits in chunks named `Bookmark`.
+fn chunk_keywords(operations: &[&str]) -> Vec<String> {
+    const KEYWORD_LEN: usize = 6;
+    let mut out: Vec<String> = Vec::new();
+    for op in operations {
+        // Leading word: characters up to the second uppercase letter.
+        let mut end = op.len();
+        for (i, c) in op.char_indices().skip(1) {
+            if c.is_ascii_uppercase() {
+                end = i;
+                break;
+            }
+        }
+        let word = op[..end].to_ascii_lowercase();
+        let keyword: String = word.chars().take(KEYWORD_LEN).collect();
+        if !keyword.is_empty() && !out.contains(&keyword) {
+            out.push(keyword);
+        }
+    }
+    out
+}
 
 fn balanced_brace_blocks(text: &str, count: usize) -> Vec<&str> {
     let bytes = text.as_bytes();
@@ -559,6 +732,14 @@ pub struct BookmarkMedia {
     pub kind: BookmarkKind,
     /// Highest-quality URL: best mp4 variant, or the original-size photo.
     pub media_url: String,
+    /// Still image representing this item, when one is cheaper than the media.
+    ///
+    /// For video this is X's poster frame -- roughly 100KB against a 5MB mp4 --
+    /// which is what makes it possible to show a real thumbnail and extract a
+    /// real palette for a reference nobody has downloaded yet. For a photo it
+    /// is `None`: the media *is* the image, and fetching a second copy at a
+    /// smaller size would be pure waste.
+    pub poster_url: Option<String>,
     /// File extension to save under.
     pub ext: &'static str,
     /// `YYYY-MM-DD` the post was created, for date filtering.
@@ -566,6 +747,61 @@ pub struct BookmarkMedia {
     /// Position within the post; a tweet can carry up to four photos.
     pub index: usize,
 }
+
+impl BookmarkMedia {
+    /// Whatever should be fetched to render a tile, without pulling the media.
+    pub fn thumbnail_source(&self) -> &str {
+        self.poster_url.as_deref().unwrap_or(&self.media_url)
+    }
+
+    /// Filename component, guaranteed not to escape its directory.
+    ///
+    /// `tweet_id` arrives from a remote JSON document, and it used to be
+    /// interpolated straight into a path. A value of `../../evil` would have
+    /// written outside the download directory. X's ids are decimal snowflakes,
+    /// so anything else is either an attack or a parser change -- both worth
+    /// refusing rather than guessing at.
+    fn safe_stem(&self) -> Option<String> {
+        if self.tweet_id.is_empty()
+            || !self.tweet_id.bytes().all(|b| b.is_ascii_digit())
+            || self.tweet_id.len() > 32
+        {
+            return None;
+        }
+        Some(format!("x_{}_{}", self.tweet_id, self.index))
+    }
+}
+
+/// Hosts X serves media from.
+///
+/// `media_url` comes out of a remote JSON document and is then fetched with the
+/// session cookies attached. Without this check a crafted timeline response
+/// could point it at an internal address and use the app as a confused deputy,
+/// or at an attacker's host and hand over the auth cookie.
+/// Whether a URL is X-hosted media, and so should be fetched with the session
+/// client rather than the generic one.
+pub fn is_x_media(url: &str) -> bool {
+    is_twimg_host(url)
+}
+
+fn is_twimg_host(url: &str) -> bool {
+    let Ok(parsed) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    parsed.host_str().is_some_and(|h| {
+        h == "twimg.com" || h.ends_with(".twimg.com") || h == "x.com" || h.ends_with(".x.com")
+    })
+}
+
+/// Refuse to stream a single file larger than this.
+///
+/// X caps uploads well below it, so tripping this means the URL is not what it
+/// claimed to be. Without a cap, a redirect to an endless response fills the
+/// disk with no natural stopping point.
+pub const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Which bookmarks to read.
 pub enum BookmarkSource {
@@ -723,19 +959,23 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
     for (index, m) in media.iter().enumerate() {
         let kind_str = m.get("type").and_then(|t| t.as_str()).unwrap_or("");
 
+        // On a video entity this is the poster frame, not the video. That is
+        // the whole basis of a linked reference: a tile and a palette for the
+        // cost of a JPEG.
+        let poster = m
+            .get("media_url_https")
+            .or_else(|| m.get("media_url"))
+            .and_then(|u| u.as_str());
+
         let found = match kind_str {
             // animated_gif is served as a silent mp4, not a .gif.
             "video" | "animated_gif" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
             // Presence of video_info is the real signal; `type` is only a hint
             // and has been absent on nested/quoted results.
             "" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
-            "photo" => m
-                .get("media_url_https")
-                .or_else(|| m.get("media_url"))
-                .and_then(|u| u.as_str())
-                // Without ?name=orig X serves a downscaled render -- 1200px
-                // wide instead of the 2048px original.
-                .map(|u| (BookmarkKind::Image, format!("{u}?name=orig"), "jpg")),
+            // Without ?name=orig X serves a downscaled render -- 1200px wide
+            // instead of the 2048px original.
+            "photo" => poster.map(|u| (BookmarkKind::Image, format!("{u}?name=orig"), "jpg")),
             _ => None,
         };
 
@@ -747,6 +987,12 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
                 text: text.clone(),
                 kind,
                 media_url,
+                // A photo's media_url is already the image; a second smaller
+                // copy would be fetched for nothing.
+                poster_url: match kind {
+                    BookmarkKind::Video => poster.map(|u| format!("{u}?name=small")),
+                    BookmarkKind::Image => None,
+                },
                 ext,
                 date: date.clone(),
                 index,
@@ -790,6 +1036,106 @@ mod tests {
         assert_eq!(blocks.len(), 2);
         assert!(blocks[0].contains(r#"1:"a""#));
         assert!(blocks[1].contains(r#"1:"h1""#), "second literal missed");
+    }
+
+    fn media(tweet_id: &str) -> BookmarkMedia {
+        BookmarkMedia {
+            tweet_id: tweet_id.to_string(),
+            tweet_url: "https://x.com/a/status/1".into(),
+            author: "a".into(),
+            text: String::new(),
+            kind: BookmarkKind::Video,
+            media_url: "https://video.twimg.com/x.mp4".into(),
+            poster_url: None,
+            ext: "mp4",
+            date: "2026-01-01".into(),
+            index: 0,
+        }
+    }
+
+    #[test]
+    fn a_tweet_id_cannot_escape_the_download_directory() {
+        // The id is remote input and used to be interpolated into a path.
+        for hostile in ["../../evil", "..", "1/../../2", "a\\b", "", "1;rm -rf"] {
+            assert!(
+                media(hostile).safe_stem().is_none(),
+                "{hostile:?} was accepted as a filename component"
+            );
+        }
+        assert_eq!(
+            media("1234567890").safe_stem().as_deref(),
+            Some("x_1234567890_0")
+        );
+    }
+
+    #[test]
+    fn only_x_hosts_are_fetchable() {
+        for ok in [
+            "https://video.twimg.com/ext_tw_video/1.mp4",
+            "https://pbs.twimg.com/media/a.jpg",
+            "https://x.com/i/status/1",
+        ] {
+            assert!(is_twimg_host(ok), "{ok} should be allowed");
+        }
+        for bad in [
+            // Cookies ride along on these requests, so an off-network host is
+            // a credential leak, and a private address is an SSRF pivot.
+            "https://evil.example/a.mp4",
+            "http://video.twimg.com/a.mp4",  // plaintext
+            "https://twimg.com.evil.test/a", // suffix confusion
+            "https://127.0.0.1/a.mp4",
+            "http://169.254.169.254/latest/meta-data/",
+            "file:///C:/Windows/win.ini",
+            "not a url",
+        ] {
+            assert!(!is_twimg_host(bad), "{bad} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_photo_uses_itself_as_its_thumbnail() {
+        let mut m = media("1");
+        m.kind = BookmarkKind::Image;
+        m.media_url = "https://pbs.twimg.com/media/a.jpg?name=orig".into();
+        assert_eq!(m.thumbnail_source(), m.media_url);
+
+        // A video prefers the poster, which is why linking is cheap.
+        let mut v = media("1");
+        v.poster_url = Some("https://pbs.twimg.com/poster.jpg".into());
+        assert_eq!(v.thumbnail_source(), "https://pbs.twimg.com/poster.jpg");
+    }
+
+    #[test]
+    fn chunk_keywords_match_how_x_names_its_bundles() {
+        // Regression guard: the candidate filter was hardcoded to "Bookmark",
+        // so asking for any other operation scanned nothing and reported the
+        // failure as "X changed its frontend".
+        assert_eq!(chunk_keywords(&["Bookmarks"]), vec!["bookma"]);
+        assert_eq!(chunk_keywords(&["TweetResultByRestId"]), vec!["tweet"]);
+        assert_eq!(
+            chunk_keywords(&["BookmarkFolderTimeline"]),
+            vec!["bookma"],
+            "should key off the leading word, not the whole identifier"
+        );
+        // Two operations sharing a prefix should not scan the same chunks twice.
+        assert_eq!(
+            chunk_keywords(&["Bookmarks", "BookmarkFoldersSlice"]),
+            vec!["bookma"]
+        );
+
+        // The keywords have to actually appear in real chunk names.
+        let keywords = chunk_keywords(&["TweetResultByRestId", "Bookmarks"]);
+        for name in [
+            "bundle.Tweet",
+            "endpoints.TweetResultByRestId",
+            "bundle.Bookmarks",
+        ] {
+            let lower = name.to_ascii_lowercase();
+            assert!(
+                keywords.iter().any(|k| lower.contains(k)),
+                "{name} would not be scanned"
+            );
+        }
     }
 
     #[test]

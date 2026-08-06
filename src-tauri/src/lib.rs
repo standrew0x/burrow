@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod image_ops;
 pub mod ingest;
+pub mod link;
 pub mod store;
 pub mod video;
 pub mod xsync;
@@ -36,6 +37,8 @@ pub fn run() {
         .manage(state)
         .invoke_handler(tauri::generate_handler![
             commands::import_paths,
+            commands::add_links,
+            commands::download_assets,
             commands::list_assets,
             commands::search_by_color,
             commands::library_root,

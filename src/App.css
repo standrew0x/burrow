@@ -292,6 +292,49 @@ button:focus-visible {
   border-color: var(--accent);
 }
 
+/* Shares the search field's styling; the two sit side by side in the bar and
+   reading as one control group is the intent. */
+.bar__link {
+  display: flex;
+  gap: 8px;
+}
+
+.bar__link input {
+  width: 190px;
+  padding: 6px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.bar__link input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.bar__link button {
+  padding: 6px 12px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.bar__link button:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+
+.bar__link button:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+
 /* ---------- sync panel ---------- */
 
 .sync {
@@ -641,6 +684,42 @@ button:focus-visible {
 .tile__select:focus-visible,
 .tile__select--on {
   opacity: 1;
+}
+
+/* Mirrors .tile__select on the opposite corner. Unlike the selection box this
+   one stays visible without hover: a linked tile looks identical to a local one
+   otherwise, and the difference is the whole point of the badge. */
+.tile__download {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  font-size: 12px;
+  line-height: 1;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1.5px solid rgba(255, 255, 255, 0.7);
+  border-radius: 5px;
+  cursor: pointer;
+}
+
+.tile__download:hover:not(:disabled) {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.tile__download--busy,
+.tile__download:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+.tile__linked {
+  color: var(--accent);
 }
 
 .tile__select--on {

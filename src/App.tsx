@@ -3,11 +3,12 @@ import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { openPath } from "@tauri-apps/plugin-opener";
 
 import {
+  addLinks,
   addToBoard,
-  blobUrl,
   createBoard,
   deleteAssets,
   deleteBoard,
+  downloadAssets,
   importPaths,
   isPlayableInline,
   libraryRoot,
@@ -15,6 +16,7 @@ import {
   listBoardAssets,
   listBoards,
   moveToBoard,
+  playbackUrl,
   removeFromBoard,
   renameBoard,
   searchByColor,
@@ -38,6 +40,27 @@ interface Notice {
   syncedFrom?: string;
   images?: number;
   videos?: number;
+  /** Present when the notice came from downloading linked references. */
+  downloaded?: number;
+  bytesWritten?: number;
+  deduplicated?: number;
+}
+
+/** Anything that looks like a link the app could resolve. */
+const URL_PATTERN = /^https?:\/\/\S+$/i;
+
+/**
+ * Pulls URLs out of pasted text.
+ *
+ * Split on whitespace rather than taking the whole string: copying a link out
+ * of a page routinely drags along surrounding text, and pasting several at once
+ * is the fastest way to add a batch.
+ */
+function urlsIn(text: string): string[] {
+  return text
+    .split(/\s+/)
+    .map((s) => s.replace(/[),.]+$/, "").trim())
+    .filter((s) => URL_PATTERN.test(s));
 }
 
 /** Batch sizes offered next to the Sync button.
@@ -104,6 +127,11 @@ export default function App() {
   /** null = the whole library. */
   const [activeBoardId, setActiveBoardId] = useState<number | null>(null);
   const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [linkInput, setLinkInput] = useState("");
+  const [addingLinks, setAddingLinks] = useState(false);
+  const [syncDownload, setSyncDownload] = useState(false);
+  /** Ids currently being fetched, so their tiles can show it. */
+  const [downloading, setDownloading] = useState<Set<number>>(new Set());
 
   const activeBoard = useMemo(
     () => boards.find((b) => b.id === activeBoardId) ?? null,
@@ -244,6 +272,88 @@ export default function App() {
     };
   }, [runImport]);
 
+  const runAddLinks = useCallback(
+    async (urls: string[]) => {
+      if (urls.length === 0) return;
+      setAddingLinks(true);
+      setError(null);
+      setNotice(null);
+      try {
+        const report = await addLinks(urls);
+        setActiveBoardId(null);
+        setColorFilter(null);
+        setNotice({
+          imported: report.imported.length,
+          duplicates: report.duplicates,
+          failed: report.failed,
+        });
+        setLinkInput("");
+        await refresh();
+        await refreshBoards();
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setAddingLinks(false);
+      }
+    },
+    [refresh, refreshBoards],
+  );
+
+  // Paste is the primary way links get in. Dragging a link cannot be caught:
+  // Tauri's dragDropEnabled (which the file drop above depends on) makes
+  // WebView2 hand OS drops to Rust as file paths and suppresses the DOM drop
+  // event, and a dragged URL carries no paths — so it arrives as an empty list
+  // with nothing to read. Turning that off to catch URL drags would break file
+  // drops, which is the worse trade.
+  useEffect(() => {
+    const onPaste = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      // Never steal a paste aimed at a field — the cookie inputs and the link
+      // box itself are all typed into.
+      if (
+        target &&
+        (target.tagName === "INPUT" ||
+          target.tagName === "TEXTAREA" ||
+          target.isContentEditable)
+      ) {
+        return;
+      }
+      const urls = urlsIn(e.clipboardData?.getData("text") ?? "");
+      if (urls.length === 0) return;
+      e.preventDefault();
+      void runAddLinks(urls);
+    };
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [runAddLinks]);
+
+  const runDownload = useCallback(
+    async (ids: number[]) => {
+      if (ids.length === 0) return;
+      setDownloading(new Set(ids));
+      setError(null);
+      setNotice(null);
+      try {
+        const report = await downloadAssets(ids);
+        setNotice({
+          imported: 0,
+          duplicates: 0,
+          failed: report.failed,
+          downloaded: report.downloaded.length,
+          bytesWritten: report.bytesWritten,
+          deduplicated: report.deduplicated,
+        });
+        await refresh();
+        await refreshBoards();
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setDownloading(new Set());
+      }
+    },
+    [refresh, refreshBoards],
+  );
+
   const toggleSelected = (id: number) =>
     setSelected((prev) => {
       const next = new Set(prev);
@@ -253,6 +363,13 @@ export default function App() {
     });
 
   const clearSelection = () => setSelected(new Set());
+
+  /** Selected references that still live on someone else's server. */
+  const selectedLinked = useMemo(
+    () =>
+      assets.filter((a) => selected.has(a.id) && a.state === "linked").map((a) => a.id),
+    [assets, selected],
+  );
 
   const showBoard = (id: number | null) => {
     setActiveBoardId(id);
@@ -272,6 +389,7 @@ export default function App() {
         from: syncFrom || undefined,
         to: syncTo || undefined,
         kinds: syncKinds,
+        download: syncDownload,
       });
       // A sync always lands in the library, so show it there rather than
       // leaving the user on a board that did not change.
@@ -526,6 +644,26 @@ export default function App() {
             </button>
           </div>
 
+          <form
+            className="bar__link"
+            onSubmit={(e) => {
+              e.preventDefault();
+              void runAddLinks(urlsIn(linkInput));
+            }}
+          >
+            <input
+              type="url"
+              value={linkInput}
+              onChange={(e) => setLinkInput(e.target.value)}
+              placeholder="Paste a link…"
+              aria-label="Add a reference from a URL"
+              spellCheck={false}
+            />
+            <button type="submit" disabled={addingLinks || !urlsIn(linkInput).length}>
+              {addingLinks ? "Adding…" : "Add link"}
+            </button>
+          </form>
+
           <form className="bar__search" onSubmit={submitHex}>
             <input
               type="text"
@@ -650,6 +788,17 @@ export default function App() {
             </label>
 
             <label>
+              <span>Fetch</span>
+              <select
+                value={syncDownload ? "download" : "link"}
+                onChange={(e) => setSyncDownload(e.target.value === "download")}
+              >
+                <option value="link">Thumbnails only (fast)</option>
+                <option value="download">Full media (slow, large)</option>
+              </select>
+            </label>
+
+            <label>
               <span>Posted after</span>
               <input type="date" value={syncFrom} onChange={(e) => setSyncFrom(e.target.value)} />
             </label>
@@ -712,6 +861,16 @@ export default function App() {
                 <strong>{notice.deleted}</strong> deleted
                 {notice.bytesFreed ? <> · {formatBytes(notice.bytesFreed)} freed</> : null}
               </>
+            ) : notice.downloaded !== undefined ? (
+              <>
+                <strong>{notice.downloaded}</strong> downloaded
+                {notice.bytesWritten ? <> · {formatBytes(notice.bytesWritten)}</> : null}
+                {/* Not a failure: the bytes were already here, so the link was
+                    merged into the copy that has them. */}
+                {notice.deduplicated ? (
+                  <> · {notice.deduplicated} already in library</>
+                ) : null}
+              </>
             ) : (
               <>
                 <strong>{notice.imported}</strong> imported
@@ -753,14 +912,14 @@ export default function App() {
                 ? "This board is empty."
                 : colorFilter
                   ? "Nothing matches that colour."
-                  : "Drop images or video here."}
+                  : "Drop images or video here, or paste a link."}
             </p>
             <p className="empty__detail">
               {activeBoard
                 ? "Go to All references, select some tiles, and add them here."
                 : colorFilter
                   ? "Try a different hue — the tolerance is deliberately tight."
-                  : "Drag files or folders from Explorer. Everything stays on this machine."}
+                  : "Drag files or folders from Explorer, or press Ctrl+V with a link copied. Linked references store only a thumbnail until you download them."}
             </p>
             {root && !colorFilter && !activeBoard && (
               <code className="empty__path">{root}</code>
@@ -800,6 +959,24 @@ export default function App() {
                         )}
                       </button>
                     )}
+                    {asset.state === "linked" && (
+                      <button
+                        type="button"
+                        className={`tile__download${
+                          downloading.has(asset.id) ? " tile__download--busy" : ""
+                        }`}
+                        disabled={downloading.has(asset.id)}
+                        onClick={() => void runDownload([asset.id])}
+                        title={
+                          downloading.has(asset.id)
+                            ? "Downloading…"
+                            : "Linked — streams from its source. Click to save a copy."
+                        }
+                        aria-label={`Download ${asset.originalName ?? "reference"}`}
+                      >
+                        {downloading.has(asset.id) ? "…" : "↓"}
+                      </button>
+                    )}
                     {/* Above .tile__play, which covers the whole media box. */}
                     <button
                       type="button"
@@ -816,7 +993,14 @@ export default function App() {
                       {asset.originalName ?? asset.hash.slice(0, 12)}
                     </span>
                     <span className="tile__dims">
-                      {asset.width}×{asset.height} · {formatBytes(asset.bytes)}
+                      {asset.width}×{asset.height} ·{" "}
+                      {asset.state === "linked" ? (
+                        <span className="tile__linked" title={asset.remoteUrl ?? ""}>
+                          linked
+                        </span>
+                      ) : (
+                        formatBytes(asset.bytes)
+                      )}
                     </span>
                   </figcaption>
                   <div className="palette">
@@ -907,6 +1091,19 @@ export default function App() {
             </button>
           )}
 
+          {selectedLinked.length > 0 && (
+            <button
+              type="button"
+              disabled={downloading.size > 0}
+              onClick={() => void runDownload(selectedLinked)}
+              title="Fetch the media for the linked references in this selection"
+            >
+              {downloading.size > 0
+                ? `Downloading ${downloading.size}…`
+                : `Download ${selectedLinked.length}`}
+            </button>
+          )}
+
           <button
             type="button"
             className="tray__delete"
@@ -940,9 +1137,13 @@ export default function App() {
           }}
         >
           <div className="player__frame" onClick={(e) => e.stopPropagation()}>
-            {isPlayableInline(playing) && !playbackFailed ? (
+            {isPlayableInline(playing) && !playbackFailed && playbackUrl(playing) ? (
               <video
-                src={blobUrl(playing)}
+                // A linked reference streams straight from its host; a local one
+                // plays off disk. The poster is the cached thumbnail either way,
+                // so there is something on screen before the first frame lands.
+                src={playbackUrl(playing) ?? undefined}
+                poster={thumbUrl(playing)}
                 controls
                 autoPlay
                 onError={() => setPlaybackFailed(true)}
@@ -950,15 +1151,28 @@ export default function App() {
             ) : (
               <div className="player__fallback">
                 <p>
-                  This one won't play in the app
-                  {playbackFailed ? " — the codec isn't supported here." : "."}
+                  {playing.state === "linked" && playbackFailed
+                    ? "That didn't stream — the link may have expired."
+                    : `This one won't play in the app${
+                        playbackFailed ? " — the codec isn't supported here." : "."
+                      }`}
                 </p>
                 <p className="player__fallbackDetail">
                   {playing.mime} · {playing.ext.toUpperCase()}
                 </p>
-                <button type="button" onClick={() => void openPath(playing.blobPath)}>
-                  Open in default player
-                </button>
+                {playing.state === "linked" ? (
+                  <button
+                    type="button"
+                    disabled={downloading.has(playing.id)}
+                    onClick={() => void runDownload([playing.id])}
+                  >
+                    {downloading.has(playing.id) ? "Downloading…" : "Download it"}
+                  </button>
+                ) : (
+                  <button type="button" onClick={() => void openPath(playing.blobPath)}>
+                    Open in default player
+                  </button>
+                )}
               </div>
             )}
             <div className="player__meta">

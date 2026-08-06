@@ -198,6 +198,13 @@ pub struct SyncReport {
 /// `folder` selects a single bookmark folder; omit it for every bookmark.
 /// `from`/`to` are inclusive `YYYY-MM-DD` bounds.
 ///
+/// `download` decides what "sync" means. Left off, each bookmark becomes a
+/// linked reference: its poster image is stored and the video is not. That is
+/// the default because the difference is not marginal -- a measured bookmark
+/// ran 16KB as a poster against 171MB as a file, so downloading a whole
+/// timeline costs gigabytes to get pictures the grid could already show.
+/// Anything linked can be downloaded later, one tile or a selection at a time.
+///
 /// Network work happens off the database mutex; the lock is taken only for the
 /// final ingest, so browsing stays responsive while media downloads.
 #[tauri::command]
@@ -209,7 +216,9 @@ pub async fn sync_from_x(
     to: Option<String>,
     // `kinds` is "all" (default), "images", or "videos".
     kinds: Option<String>,
+    download: Option<bool>,
 ) -> Result<SyncReport> {
+    let download = download.unwrap_or(false);
     let library_root = state.library.root().to_path_buf();
     let kinds = kinds.unwrap_or_else(|| "all".to_string());
     let opts = crate::xsync::FetchOptions {
@@ -260,6 +269,37 @@ pub async fn sync_from_x(
         };
 
         let items = client.fetch_bookmarks(&spec, &source, &opts)?;
+        let found = items.len();
+        let mut failed = Vec::new();
+
+        if !download {
+            // Link-only: fetch the poster for each item and nothing else.
+            let mut links = Vec::with_capacity(items.len());
+            for item in &items {
+                match client.fetch_thumbnail(item) {
+                    Ok(thumbnail) => links.push(crate::ingest::PendingLink {
+                        page_url: item.tweet_url.clone(),
+                        media_url: item.media_url.clone(),
+                        kind: match item.kind {
+                            crate::xsync::BookmarkKind::Video => crate::ingest::MediaKind::Video,
+                            crate::xsync::BookmarkKind::Image => crate::ingest::MediaKind::Image,
+                        },
+                        title: Some(describe_post(item)),
+                        thumbnail,
+                    }),
+                    Err(e) => failed.push(crate::ingest::FailedImport {
+                        path: item.tweet_url.clone(),
+                        reason: e.to_string(),
+                    }),
+                }
+            }
+            return Ok(Fetched::Links {
+                label,
+                found,
+                links,
+                failed,
+            });
+        }
 
         // Staged outside the library so a failed run leaves no half-imported
         // blobs behind; ingest copies what it accepts.
@@ -267,64 +307,241 @@ pub async fn sync_from_x(
         std::fs::create_dir_all(&staging).map_err(|e| Error::io(&staging, e))?;
 
         let mut downloaded = Vec::new();
-        let mut failed = Vec::new();
         for item in &items {
             match client.download(item, &staging) {
-                Ok(p) => downloaded.push((p, item.tweet_url.clone(), item.kind)),
+                Ok(p) => downloaded.push((p, item.tweet_url.clone())),
                 Err(e) => failed.push(crate::ingest::FailedImport {
                     path: item.tweet_url.clone(),
                     reason: e.to_string(),
                 }),
             }
         }
-        Ok((label, items.len(), downloaded, failed, staging))
+        Ok(Fetched::Files {
+            label,
+            found,
+            downloaded,
+            failed,
+            staging,
+        })
     })
     .await
     .map_err(|e| Error::X(format!("sync task panicked: {e}")))??;
 
-    let (label, found, downloaded, mut failed, staging) = fetched;
+    match fetched {
+        Fetched::Links {
+            label,
+            found,
+            links,
+            mut failed,
+        } => {
+            let offered = links.len();
+            let mut report = {
+                let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+                ingest::import_links(&state.library, &mut conn, links)?
+            };
+            let images = count_images(&report.imported);
+            failed.append(&mut report.failed);
+            Ok(SyncReport {
+                source: label,
+                found,
+                // Posters, not media. Naming it "downloaded" would overstate
+                // what just landed on disk by three orders of magnitude.
+                downloaded: offered,
+                imported: report.imported.len(),
+                duplicates: report.duplicates,
+                images,
+                videos: report.imported.len() - images,
+                failed,
+            })
+        }
+        Fetched::Files {
+            label,
+            found,
+            downloaded,
+            mut failed,
+            staging,
+        } => {
+            let files: Vec<std::path::PathBuf> =
+                downloaded.iter().map(|(p, _)| p.clone()).collect();
+            let mut report = {
+                let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+                ingest::import_paths(&state.library, &mut conn, &files)?
+            };
 
-    let files: Vec<std::path::PathBuf> = downloaded.iter().map(|(p, _, _)| p.clone()).collect();
-    let mut report = {
-        let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-        ingest::import_paths(&state.library, &mut conn, &files)?
-    };
-
-    // Record where each one came from, so a tile can lead back to the post.
-    {
-        let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-        let mut stmt = conn.prepare("UPDATE assets SET source_url = ?1 WHERE id = ?2")?;
-        for asset in &report.imported {
-            let name = asset.original_name.clone().unwrap_or_default();
-            if let Some((_, url, _)) = downloaded.iter().find(|(p, _, _)| {
-                p.file_name().map(|f| f.to_string_lossy() == name.as_str()) == Some(true)
-            }) {
-                stmt.execute(rusqlite::params![url, asset.id])?;
+            // Record where each one came from, so a tile can lead back to the post.
+            {
+                let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+                let mut stmt = conn.prepare("UPDATE assets SET source_url = ?1 WHERE id = ?2")?;
+                for asset in &report.imported {
+                    let name = asset.original_name.clone().unwrap_or_default();
+                    if let Some((_, url)) = downloaded.iter().find(|(p, _)| {
+                        p.file_name().map(|f| f.to_string_lossy() == name.as_str()) == Some(true)
+                    }) {
+                        stmt.execute(rusqlite::params![url, asset.id])?;
+                    }
+                }
             }
+
+            // Staging is pure scratch once ingest has copied what it wants.
+            let _ = std::fs::remove_dir_all(&staging);
+
+            let images = count_images(&report.imported);
+            failed.append(&mut report.failed);
+            Ok(SyncReport {
+                source: label,
+                found,
+                downloaded: files.len(),
+                imported: report.imported.len(),
+                duplicates: report.duplicates,
+                images,
+                videos: report.imported.len() - images,
+                failed,
+            })
         }
     }
+}
 
-    // Staging is pure scratch once ingest has copied what it wants.
-    let _ = std::fs::remove_dir_all(&staging);
+/// What the blocking half of a sync produced.
+enum Fetched {
+    Links {
+        label: String,
+        found: usize,
+        links: Vec<crate::ingest::PendingLink>,
+        failed: Vec<crate::ingest::FailedImport>,
+    },
+    Files {
+        label: String,
+        found: usize,
+        downloaded: Vec<(std::path::PathBuf, String)>,
+        failed: Vec<crate::ingest::FailedImport>,
+        staging: std::path::PathBuf,
+    },
+}
 
-    let images = report
-        .imported
+fn count_images(assets: &[AssetRow]) -> usize {
+    assets
         .iter()
         .filter(|a| a.kind == crate::ingest::MediaKind::Image)
-        .count();
-    let videos = report.imported.len() - images;
+        .count()
+}
 
+/// A one-line label for a post, used as the reference's name.
+fn describe_post(item: &crate::xsync::BookmarkMedia) -> String {
+    let text = item.text.replace(['\n', '\r'], " ");
+    let text = text.trim();
+    if text.is_empty() {
+        return format!("@{}", item.author);
+    }
+    // Truncated on a character boundary; a byte slice would panic on the first
+    // emoji, which X posts are not short of.
+    let short: String = text.chars().take(70).collect();
+    if short.chars().count() < text.chars().count() {
+        format!("@{} — {}…", item.author, short.trim_end())
+    } else {
+        format!("@{} — {short}", item.author)
+    }
+}
+
+/// Adds references from pasted URLs, fetching only a preview image.
+///
+/// X post links go through the authenticated client, which can read the media
+/// out of the timeline API; everything else is resolved from its OpenGraph
+/// tags. The two use different HTTP clients on purpose -- see [`crate::link`].
+#[tauri::command]
+pub async fn add_links(
+    state: tauri::State<'_, AppState>,
+    urls: Vec<String>,
+) -> Result<ImportReport> {
+    let library_root = state.library.root().to_path_buf();
+
+    let (links, failed) = tauri::async_runtime::spawn_blocking(
+        move || -> (Vec<crate::ingest::PendingLink>, Vec<crate::ingest::FailedImport>) {
+            // An X session is optional. Without one, x.com links still resolve
+            // through OpenGraph -- worse metadata, but a working tile.
+            let x = crate::store::Library::open(&library_root)
+                .ok()
+                .and_then(|lib| crate::xsync::XSession::load(&lib).ok())
+                .and_then(|session| crate::xsync::XClient::new(session).ok());
+
+            let mut links = Vec::new();
+            let mut failed = Vec::new();
+            for url in urls {
+                let url = url.trim().to_string();
+                if url.is_empty() {
+                    continue;
+                }
+                match crate::link::resolve(&url, x.as_ref()) {
+                    Ok(r) => links.push(crate::ingest::PendingLink {
+                        page_url: r.page_url,
+                        media_url: r.media_url,
+                        kind: r.kind,
+                        title: r.title,
+                        thumbnail: r.thumbnail,
+                    }),
+                    Err(e) => failed.push(crate::ingest::FailedImport {
+                        path: url,
+                        reason: e.to_string(),
+                    }),
+                }
+            }
+            (links, failed)
+        },
+    )
+    .await
+    .map_err(|e| Error::Link(format!("link resolution panicked: {e}")))?;
+
+    let mut report = {
+        let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+        ingest::import_links(&state.library, &mut conn, links)?
+    };
+    let mut failed = failed;
     failed.append(&mut report.failed);
-    Ok(SyncReport {
-        source: label,
-        found,
-        downloaded: files.len(),
-        imported: report.imported.len(),
-        duplicates: report.duplicates,
-        images,
-        videos,
-        failed,
-    })
+    report.failed = failed;
+    Ok(report)
+}
+
+/// Downloads the media behind linked references.
+///
+/// Emits a `download-progress` event per item so a long run over a selection
+/// reports which one it is on rather than freezing the UI.
+///
+/// Synchronous, and that is load-bearing. `reqwest::blocking::Client` owns an
+/// internal tokio runtime, and dropping a runtime inside an async context
+/// panics -- so an `async` version that built the X client in `spawn_blocking`
+/// and returned it here blew up on drop, at the end of the command, poisoning
+/// the database mutex and taking every later command down with it. The client
+/// must be created and dropped on the same non-async thread. Tauri runs sync
+/// commands off the UI thread, which is what `import_paths` already relies on
+/// for equally long work.
+#[tauri::command]
+pub fn download_assets(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, AppState>,
+    asset_ids: Vec<i64>,
+) -> Result<crate::ingest::DownloadReport> {
+    use tauri::Emitter;
+
+    // One client for X media, one for everything else. Handing a non-X URL to
+    // the cookie-bearing client would send the session to a stranger's server.
+    let x = crate::xsync::XSession::load(&state.library)
+        .ok()
+        .and_then(|session| crate::xsync::XClient::new(session).ok());
+
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::download_assets(
+        &state.library,
+        &mut conn,
+        &asset_ids,
+        |url, dest| match (&x, crate::xsync::is_x_media(url)) {
+            (Some(client), true) => client.stream_to(url, dest),
+            // No session, or not an X URL: the generic path, which validates
+            // the address and caps the transfer.
+            _ => crate::link::download_to(url, dest),
+        },
+        |id, done, total| {
+            let _ = app.emit("download-progress", (id, done, total));
+        },
+    )
 }
 
 /// Bookmark folder names, so the UI can offer them instead of hardcoding one.

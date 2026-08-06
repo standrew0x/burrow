@@ -118,9 +118,55 @@ pub fn tooling_available() -> bool {
     })
 }
 
+/// Protocols ffmpeg may use when the input is a URL.
+///
+/// ffmpeg speaks far more than HTTP -- `file`, `concat`, `subfile` and friends
+/// are all enabled by default, and a URL that redirects into one of those turns
+/// a thumbnail request into a local file read. The input is remote-controlled,
+/// so the protocol set has to be stated rather than defaulted.
+const REMOTE_PROTOCOLS: &str = "http,https,tcp,tls,crypto";
+
+/// Where ffmpeg should read from.
+#[derive(Debug, Clone, Copy)]
+pub enum Source<'a> {
+    File(&'a Path),
+    /// An `https://` URL, read over the network by ffmpeg itself. Only a few
+    /// seconds around the seek point get transferred, not the whole file.
+    Url(&'a str),
+}
+
+impl Source<'_> {
+    fn describe(&self) -> String {
+        match self {
+            Source::File(p) => p.display().to_string(),
+            Source::Url(u) => (*u).to_string(),
+        }
+    }
+
+    /// Arguments that must precede `-i`.
+    fn guard_args(&self) -> Vec<&'static str> {
+        match self {
+            Source::File(_) => Vec::new(),
+            Source::Url(_) => vec!["-protocol_whitelist", REMOTE_PROTOCOLS],
+        }
+    }
+
+    fn input(&self) -> &std::ffi::OsStr {
+        match self {
+            Source::File(p) => p.as_os_str(),
+            Source::Url(u) => std::ffi::OsStr::new(*u),
+        }
+    }
+}
+
 /// Reads stream metadata. `Ok(None)` means the file has no video stream --
 /// an audio file, or something ffprobe understands but we do not want.
 pub fn probe(path: &Path) -> Result<Option<VideoInfo>> {
+    probe_source(Source::File(path))
+}
+
+/// Reads stream metadata from a file or a remote URL.
+pub fn probe_source(source: Source<'_>) -> Result<Option<VideoInfo>> {
     let output = Command::new(tool("ffprobe"))
         .args([
             "-v",
@@ -132,7 +178,8 @@ pub fn probe(path: &Path) -> Result<Option<VideoInfo>> {
             "-print_format",
             "json",
         ])
-        .arg(path)
+        .args(source.guard_args())
+        .arg(source.input())
         .output()
         .map_err(|e| tool_missing("ffprobe", &e))?;
 
@@ -193,16 +240,26 @@ pub fn poster_offset_seconds(duration_ms: i64) -> f64 {
 /// Piped through stdout rather than a temp file: no cleanup, no collisions
 /// between parallel imports, and the frame is small enough to hold in memory.
 pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
+    extract_poster_frame_from(Source::File(path), duration_ms)
+}
+
+/// Decodes one frame from a file or a remote URL.
+///
+/// Against a URL this is a range request around the seek point rather than a
+/// full download, which is what makes it affordable to thumbnail a video that
+/// is only ever going to be linked.
+pub fn extract_poster_frame_from(source: Source<'_>, duration_ms: i64) -> Result<Vec<u8>> {
     let offset = poster_offset_seconds(duration_ms);
 
     let output = Command::new(tool("ffmpeg"))
         .args(["-v", "error"])
+        .args(source.guard_args())
         // -ss BEFORE -i is the fast path: ffmpeg seeks the container instead of
         // decoding every frame up to the offset. On a long video that is the
         // difference between milliseconds and tens of seconds.
         .args(["-ss", &format!("{offset:.3}")])
         .arg("-i")
-        .arg(path)
+        .arg(source.input())
         .args([
             "-frames:v",
             "1",
@@ -221,7 +278,7 @@ pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
         let detail = stderr.lines().last().unwrap_or("no output").trim();
         return Err(Error::Ffmpeg(format!(
             "could not extract a frame from {}: {detail}",
-            path.display()
+            source.describe()
         )));
     }
 

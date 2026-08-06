@@ -84,6 +84,40 @@ const MIGRATIONS: &[&str] = &[
     -- Deleting an asset must cascade cheaply from the asset side too.
     CREATE INDEX board_items_asset ON board_items(asset_id);
     "#,
+    // --- v4: linked references ---
+    //
+    // A linked asset is one we hold a thumbnail and a URL for, but no bytes.
+    // That splits two jobs `hash` used to do alone:
+    //
+    //   hash          storage key. Names the blob and thumbnail files, UNIQUE,
+    //                 and never changes for the lifetime of the row. For a
+    //                 local import it is the content digest, as before. For a
+    //                 link it is the digest of the remote URL, because there
+    //                 are no bytes to digest yet.
+    //   content_hash  the real digest, once bytes exist. NULL while linked.
+    //
+    // Keeping `hash` stable is what lets a download write its blob straight to
+    // the path the row already claims. The alternative -- re-keying the row to
+    // the content digest on download -- means renaming the thumbnail and blob
+    // underneath a live UI, and a crash mid-rename leaves a row pointing at
+    // nothing.
+    //
+    // Backfilling content_hash = hash for existing rows is what keeps dedupe a
+    // single uniform query afterwards: every local row has a content_hash, so
+    // nothing has to special-case "imported before v4".
+    r#"
+    ALTER TABLE assets ADD COLUMN state TEXT NOT NULL DEFAULT 'local';
+    ALTER TABLE assets ADD COLUMN remote_url TEXT;
+    ALTER TABLE assets ADD COLUMN content_hash TEXT;
+    UPDATE assets SET content_hash = hash;
+
+    CREATE INDEX assets_state ON assets(state);
+    -- Downloads look up "do I already hold these bytes?" on every completion.
+    CREATE INDEX assets_content_hash ON assets(content_hash);
+    -- Adding the same link twice must be caught before it costs a fetch.
+    CREATE UNIQUE INDEX assets_remote_url ON assets(remote_url)
+        WHERE remote_url IS NOT NULL;
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.
@@ -230,6 +264,96 @@ mod tests {
             })
             .unwrap();
         assert_eq!(kind, "image", "existing row survived the upgrade");
+    }
+
+    #[test]
+    fn v4_defaults_a_row_to_local_with_no_link_fields() {
+        let conn = open_in_memory().expect("open");
+        conn.execute(
+            "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+             VALUES ('abc', 'png', 'image/png', 1, 1, 1, 0)",
+            [],
+        )
+        .unwrap();
+
+        let (state, remote): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, remote_url FROM assets WHERE hash='abc'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+
+        assert_eq!(state, "local", "a row with bytes on disk is not a link");
+        assert_eq!(remote, None);
+
+        // content_hash is deliberately NOT asserted here. The v4 backfill only
+        // reaches rows that existed when it ran; SQLite cannot express a DEFAULT
+        // that copies another column, so every new insert has to write it. That
+        // obligation is enforced where it can actually break -- see
+        // ingest::tests::a_local_import_records_its_content_hash.
+    }
+
+    #[test]
+    fn a_v3_library_upgrades_in_place() {
+        // A library from before links existed: apply the first three migrations,
+        // put a real row in it, then upgrade. The backfill has to reach rows
+        // that were already there, which is the case a fresh database misses.
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(3) {
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {};\nCOMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+             VALUES ('legacy', 'jpg', 'image/jpeg', 4, 4, 16, 0)",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).expect("upgrade v3 -> latest");
+
+        let (state, content_hash): (String, Option<String>) = conn
+            .query_row(
+                "SELECT state, content_hash FROM assets WHERE hash='legacy'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(state, "local");
+        assert_eq!(
+            content_hash.as_deref(),
+            Some("legacy"),
+            "the backfill skipped a row that predated the migration"
+        );
+    }
+
+    #[test]
+    fn the_same_link_cannot_be_added_twice() {
+        let conn = open_in_memory().expect("open");
+        let insert = "INSERT INTO assets
+            (hash, ext, mime, width, height, bytes, imported_at, state, remote_url)
+            VALUES (?1, 'mp4', 'video/mp4', 1, 1, 0, 0, 'linked', ?2)";
+
+        conn.execute(insert, ["h1", "https://video.twimg.com/a.mp4"])
+            .expect("first link");
+        assert!(
+            conn.execute(insert, ["h2", "https://video.twimg.com/a.mp4"])
+                .is_err(),
+            "the same remote URL landed twice; the partial index is not enforcing"
+        );
+
+        // The index is partial, so NULL remote_url (every local import) must
+        // still be insertable any number of times.
+        let local = "INSERT INTO assets (hash, ext, mime, width, height, bytes, imported_at)
+                     VALUES (?1, 'png', 'image/png', 1, 1, 1, 0)";
+        conn.execute(local, ["l1"]).unwrap();
+        conn.execute(local, ["l2"])
+            .expect("NULL remote_url must not collide with another NULL");
     }
 
     #[test]

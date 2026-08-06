@@ -14,26 +14,50 @@ export interface Swatch {
 
 export type MediaKind = "image" | "video";
 
+/**
+ * Whether the library holds this reference's bytes.
+ *
+ * `linked` means only a thumbnail was stored; the media plays by streaming from
+ * `remoteUrl` and can be downloaded later.
+ */
+export type AssetState = "local" | "linked";
+
 export interface Asset {
   id: number;
   hash: string;
   kind: MediaKind;
-  /** Milliseconds; null for images. */
+  state: AssetState;
+  /** Milliseconds. Null for images, and for links nothing has read yet. */
   durationMs: number | null;
   ext: string;
   mime: string;
   width: number;
   height: number;
+  /** Size on disk — zero while linked. */
   bytes: number;
   originalName: string | null;
+  /** The page this came from, for "open original". */
   sourceUrl: string | null;
+  /** The media file on the remote host; present only while linked. */
+  remoteUrl: string | null;
   importedAt: number;
   swatches: Swatch[];
   /** Absolute path; run through convertFileSrc before use in an <img>. */
   thumbPath: string;
-  /** Absolute path to the stored original, for video playback. */
+  /** Absolute path to the stored original. Meaningless while linked. */
   blobPath: string;
 }
+
+export interface DownloadReport {
+  downloaded: Asset[];
+  /** Links whose bytes were already in the library; the row was merged away. */
+  deduplicated: number;
+  bytesWritten: number;
+  failed: FailedImport[];
+}
+
+/** `[assetId, done, total]` — payload of the `download-progress` event. */
+export type DownloadProgress = [number, number, number];
 
 export interface FailedImport {
   path: string;
@@ -78,6 +102,12 @@ export interface SyncOptions {
   from?: string;
   to?: string;
   kinds?: SyncKinds;
+  /**
+   * Pull the actual media rather than just posters. Off by default: a poster
+   * measured 16KB against a 171MB video, so downloading a whole timeline costs
+   * gigabytes to show pictures the grid already has.
+   */
+  download?: boolean;
 }
 
 export interface SyncReport {
