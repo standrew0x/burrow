@@ -24,19 +24,10 @@ fn main() {
     let lib = Library::open(&scratch).expect("open library");
     let mut conn = burrow_lib::db::open(&lib.db_path()).expect("open db");
 
-    // Optional: only X post links need it.
-    let x = burrow_lib::xsync::XSession::load(&lib)
-        .ok()
-        .and_then(|s| burrow_lib::xsync::XClient::new(s).ok());
-    println!(
-        "X session: {}\n",
-        if x.is_some() { "loaded" } else { "none" }
-    );
-
     let mut pending = Vec::new();
     for url in &urls {
         print!("resolving {url}\n  ");
-        match burrow_lib::link::resolve(url, x.as_ref()) {
+        match burrow_lib::link::resolve(url) {
             Ok(r) => {
                 println!(
                     "{:?}  thumb={}B  title={:?}",
@@ -114,13 +105,9 @@ fn main() {
         &lib,
         &mut conn,
         &[first.id],
-        |url, dest| match burrow_lib::xsync::is_x_media(url) {
-            true => match &x {
-                Some(client) => client.stream_to(url, dest),
-                None => burrow_lib::link::download_to(url, dest),
-            },
-            false => burrow_lib::link::download_to(url, dest),
-        },
+        // The generic downloader for everything, including twimg: media URLs
+        // from a public post are public, so nothing here needs the session.
+        burrow_lib::link::download_to,
         |_, n, total| println!("  {n}/{total}"),
     )
     .expect("download");

@@ -32,10 +32,18 @@ const LOADER_SCAN_BYTES: usize = 400_000;
 /// Timeline page size. X accepts up to 100.
 const PAGE_SIZE: u32 = 100;
 
-/// Hard cap on pages walked in one fetch. A narrow date window deep in the
-/// past would otherwise page through the entire bookmark history; better to
-/// return what was found than to hammer X indefinitely.
-const MAX_PAGES: usize = 40;
+/// Hard cap on pages walked in one fetch, so a request for "everything" cannot
+/// hammer X indefinitely. At 100 posts a page this is 10,000 bookmarks; hitting
+/// it is reported rather than passed off as the end of the list.
+const MAX_PAGES: usize = 100;
+
+/// Consecutive pages entirely older than `from` before paging gives up.
+///
+/// Cannot be 1. Bookmarks come back in the order they were bookmarked, so page
+/// ranges overlap -- one measured pair ran 2025-11-20..2026-01-22 followed by
+/// 2025-10-28..2025-12-30. Three pages is 300 posts of margin past the point
+/// where the window looks finished.
+const STALE_PAGES_BEFORE_STOP: usize = 3;
 
 #[derive(Debug)]
 pub enum XError {
@@ -410,53 +418,25 @@ impl XClient {
             .collect())
     }
 
-    /// Media attached to one post, by id.
+    /// Images and videos from bookmarks.
     ///
-    /// Backs pasting a link to a single post. Discovery runs per call rather
-    /// than being cached alongside the bookmark specs: pasting a link is a
-    /// one-off, and a stale query id fails the whole request with a message
-    /// about GraphQL that means nothing to the person who pasted a URL.
-    pub fn tweet_media(&self, status_id: &str) -> Result<Vec<BookmarkMedia>> {
-        if status_id.is_empty() || !status_id.bytes().all(|b| b.is_ascii_digit()) {
-            return Err(Error::X(format!("{status_id:?} is not a post id")));
-        }
-        let specs = self
-            .discover(&["TweetResultByRestId"])
-            .map_err(|e| Error::X(e.to_string()))?;
-        let spec = specs
-            .first()
-            .ok_or_else(|| Error::X("could not locate the post lookup API".into()))?;
-
-        let data = self
-            .graphql(
-                spec,
-                "TweetResultByRestId",
-                serde_json::json!({
-                    "tweetId": status_id,
-                    "includePromotedContent": false,
-                    "withCommunity": false,
-                    "withVoice": false,
-                }),
-            )
-            .map_err(|e| Error::X(e.to_string()))?;
-
-        let result = data
-            .pointer("/tweetResult/result")
-            .ok_or_else(|| Error::X(format!("post {status_id} is unavailable or protected")))?;
-        Ok(media_from_tweet(result))
-    }
-
-    /// Images and videos from bookmarks, newest first.
+    /// Walks pages until the requested number of items is collected, the
+    /// bookmark list runs out, or the page cap is reached -- and says which,
+    /// because a sync that quietly returns less than the filter should match is
+    /// indistinguishable from a broken one.
     ///
-    /// The timeline is strictly newest-first, which makes the date window
-    /// cheap: anything newer than `to` is skipped, and the first post older
-    /// than `from` ends paging entirely rather than walking the whole history.
+    /// The order this timeline arrives in is the order posts were *bookmarked*,
+    /// which is not the order they were written. Measured over 791 consecutive
+    /// bookmarks: 185 places where a post was older than the one after it, the
+    /// first only seven items into page 1. So an out-of-window post says
+    /// nothing about the posts behind it, and per-item filtering has to keep
+    /// going rather than conclude the window is finished.
     pub fn fetch_bookmarks(
         &self,
         spec: &QuerySpec,
         source: &BookmarkSource,
         opts: &FetchOptions,
-    ) -> std::result::Result<Vec<BookmarkMedia>, XError> {
+    ) -> std::result::Result<Fetched, XError> {
         let (op_name, base_vars) = match source {
             BookmarkSource::All => (
                 "Bookmarks",
@@ -471,8 +451,15 @@ impl XClient {
         let mut out: Vec<BookmarkMedia> = Vec::new();
         let mut cursor: Option<String> = None;
         let mut pages = 0usize;
+        let mut posts_scanned = 0usize;
+        let mut stale_pages = 0usize;
+        let mut stop = StopReason::EndOfBookmarks;
 
-        'paging: while out.len() < opts.limit && pages < MAX_PAGES {
+        'paging: while pages < MAX_PAGES {
+            if out.len() >= opts.limit {
+                stop = StopReason::LimitReached;
+                break;
+            }
             pages += 1;
             let mut vars = base_vars.clone();
             if let Some(c) = &cursor {
@@ -481,51 +468,49 @@ impl XClient {
 
             let data = self.graphql(spec, op_name, vars)?;
             let (tweets, next) = extract_tweets_and_cursor(&data);
-            if tweets.is_empty() {
-                break;
+            posts_scanned += tweets.len();
+
+            let page = collect_page(&tweets, opts, &mut out);
+            if out.len() >= opts.limit {
+                stop = StopReason::LimitReached;
+                break 'paging;
             }
 
-            for tweet in &tweets {
-                let all_items = media_from_tweet(tweet);
-                // Date is a property of the post, so read it before filtering by
-                // kind -- otherwise a photo-only post in an images-excluded sync
-                // would stop contributing its date and break the paging cutoff.
-                let Some(first) = all_items.first() else {
-                    continue;
-                };
-
-                // Undated posts are kept: dropping them would silently lose
-                // references over a parsing detail.
-                if !first.date.is_empty() {
-                    if let Some(from) = &opts.from {
-                        if first.date.as_str() < from.as_str() {
-                            break 'paging;
+            // Give up on a lower bound only once several whole pages have been
+            // older than it. One page is not enough -- page date ranges overlap.
+            if let Some(from) = &opts.from {
+                match &page.newest {
+                    Some(newest) if newest.as_str() < from.as_str() => {
+                        stale_pages += 1;
+                        if stale_pages >= STALE_PAGES_BEFORE_STOP {
+                            stop = StopReason::PastDateWindow;
+                            break;
                         }
                     }
-                    if let Some(to) = &opts.to {
-                        if first.date.as_str() > to.as_str() {
-                            continue;
-                        }
-                    }
-                }
-
-                for item in all_items {
-                    if !opts.wants(item.kind) {
-                        continue;
-                    }
-                    out.push(item);
-                    if out.len() >= opts.limit {
-                        break 'paging;
-                    }
+                    _ => stale_pages = 0,
                 }
             }
 
             match next {
-                Some(c) => cursor = Some(c),
-                None => break,
+                // X hands back the same cursor at the end of some timelines
+                // instead of omitting it, which would page forever.
+                Some(c) if Some(&c) != cursor.as_ref() => cursor = Some(c),
+                _ => {
+                    stop = StopReason::EndOfBookmarks;
+                    break;
+                }
+            }
+            if pages >= MAX_PAGES {
+                stop = StopReason::PageCap;
             }
         }
-        Ok(out)
+
+        Ok(Fetched {
+            items: out,
+            stop,
+            pages,
+            posts_scanned,
+        })
     }
 
     /// Streams one media item to `dir`. Returns the written path.
@@ -649,6 +634,208 @@ impl XClient {
     }
 }
 
+/// What one page of the timeline contributed.
+struct PageSummary {
+    /// Newest post date seen, regardless of whether it passed the filters.
+    /// `None` when nothing on the page carried a readable date.
+    newest: Option<String>,
+}
+
+/// Appends every wanted item on one page to `out`.
+///
+/// Split out of the paging loop so the filtering can be tested without a
+/// network: the bug it exists to prevent -- ending a whole sync at the first
+/// post older than the start date -- is invisible from the outside, because a
+/// truncated sync and a small library return the same thing.
+///
+/// Stops adding once `out` reaches the limit; the caller decides what that
+/// means for paging.
+fn collect_page(
+    tweets: &[Value],
+    opts: &FetchOptions,
+    out: &mut Vec<BookmarkMedia>,
+) -> PageSummary {
+    let mut newest: Option<String> = None;
+
+    for tweet in tweets {
+        if out.len() >= opts.limit {
+            break;
+        }
+        let all_items = media_from_tweet(tweet);
+        // The date belongs to the post, so read it before the kind filter --
+        // otherwise a photo-only post in a videos-only sync stops contributing
+        // its date and the caller's stop heuristic goes blind.
+        let Some(first) = all_items.first() else {
+            continue;
+        };
+
+        // Undated posts are kept: dropping them would silently lose references
+        // over a parsing detail.
+        if !first.date.is_empty() {
+            if newest.as_deref().is_none_or(|n| first.date.as_str() > n) {
+                newest = Some(first.date.clone());
+            }
+            // Skip, never stop. Bookmarks arrive in the order they were saved,
+            // not the order they were written, so an out-of-window post says
+            // nothing at all about the ones behind it.
+            if opts
+                .from
+                .as_deref()
+                .is_some_and(|f| first.date.as_str() < f)
+            {
+                continue;
+            }
+            if opts.to.as_deref().is_some_and(|t| first.date.as_str() > t) {
+                continue;
+            }
+        }
+
+        for item in all_items {
+            if !opts.wants(item.kind) {
+                continue;
+            }
+            out.push(item);
+            if out.len() >= opts.limit {
+                break;
+            }
+        }
+    }
+
+    PageSummary { newest }
+}
+
+// --- single posts ---
+
+/// Media attached to one public post, by id.
+///
+/// Backs pasting a link. Deliberately a free function rather than a method on
+/// [`XClient`]: this route needs no session at all, so pasting a link works
+/// before X is connected and keeps working after the cookies expire.
+///
+/// It reads the endpoint that serves embedded posts on other people's websites.
+/// The timeline API is not an option any more -- every GraphQL operation in X's
+/// web bundle was enumerated (630 chunks, 191 operations) and not one of them
+/// reads a single post by id; `TweetResultByRestId` and `TweetDetail` are both
+/// gone. The embed endpoint is a different service, still public, and returns
+/// strictly more than the page's meta tags do: the real mp4 variants rather
+/// than a preview image.
+///
+/// The request carries no cookies. It goes to a different host than the
+/// timeline API, and sending the session there would hand X's CDN -- and
+/// anything that could impersonate it -- a live login.
+pub fn public_post(status_id: &str) -> Result<Vec<BookmarkMedia>> {
+    if status_id.is_empty()
+        || !status_id.bytes().all(|b| b.is_ascii_digit())
+        || status_id.len() > 32
+    {
+        return Err(Error::X(format!("{status_id:?} is not a post id")));
+    }
+
+    let http = reqwest::blocking::Client::builder()
+        .user_agent(UA)
+        .timeout(Duration::from_secs(30))
+        // No redirects: the response is JSON from a known host, and following a
+        // hop would be a way to move this request somewhere else entirely.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| Error::X(e.to_string()))?;
+
+    let url = format!(
+        "https://cdn.syndication.twimg.com/tweet-result?id={}&token={}&lang=en",
+        status_id,
+        syndication_token(status_id)
+    );
+    let resp = http
+        .get(&url)
+        .header("referer", "https://platform.twitter.com/")
+        .send()
+        .map_err(|e| Error::X(format!("reading post {status_id}: {e}")))?;
+
+    let status = resp.status().as_u16();
+    if status == 404 {
+        return Err(Error::X(format!(
+            "post {status_id} is not public — protected accounts and deleted posts \
+             cannot be read this way. Bookmark it on X and use Sync from X instead."
+        )));
+    }
+    if !resp.status().is_success() {
+        return Err(Error::X(format!("reading post {status_id}: HTTP {status}")));
+    }
+    let body: Value = resp
+        .json()
+        .map_err(|e| Error::X(format!("post {status_id}: {e}")))?;
+
+    Ok(media_from_tweet(&syndication_to_legacy(&body)))
+}
+
+/// Reshapes an embed response into the timeline shape.
+///
+/// The two carry the same media objects under different names, so converting is
+/// cheaper than a second extractor -- and it means a pasted link goes through
+/// exactly the parsing that bookmark sync does, including picking the highest
+/// bitrate mp4 and asking for photos at original size.
+fn syndication_to_legacy(body: &Value) -> Value {
+    let media = body
+        .get("mediaDetails")
+        .or_else(|| body.pointer("/extended_entities/media"))
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+
+    serde_json::json!({
+        "legacy": {
+            "id_str": body.get("id_str").and_then(|v| v.as_str()).unwrap_or(""),
+            "created_at": body.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+            "full_text": body.get("text").or_else(|| body.get("full_text"))
+                .and_then(|v| v.as_str()).unwrap_or(""),
+            "extended_entities": { "media": media },
+        },
+        "core": { "user_results": { "result": { "core": {
+            "screen_name": body.pointer("/user/screen_name")
+                .and_then(|v| v.as_str()).unwrap_or(""),
+        }}}},
+    })
+}
+
+/// The embed endpoint's anti-scrape token, derived from the post id.
+///
+/// `((id / 1e15) * PI)` in base 36 with zeros and the decimal point removed --
+/// what X's own embed widget sends. It is not currently checked (a literal "a"
+/// is accepted), but sending what the widget sends costs nothing and is the
+/// difference between working and not on the day they start checking.
+fn syndication_token(status_id: &str) -> String {
+    const DIGITS: &[u8] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let Ok(id) = status_id.parse::<u64>() else {
+        return "a".into();
+    };
+    let mut v = (id as f64 / 1e15) * std::f64::consts::PI;
+
+    let mut int_part = v.trunc() as u64;
+    v -= v.trunc();
+    let mut int_s = String::new();
+    if int_part == 0 {
+        int_s.push('0');
+    }
+    while int_part > 0 {
+        int_s.insert(0, DIGITS[(int_part % 36) as usize] as char);
+        int_part /= 36;
+    }
+
+    let mut frac = String::new();
+    for _ in 0..12 {
+        v *= 36.0;
+        let d = v.trunc() as usize;
+        frac.push(DIGITS[d.min(35)] as char);
+        v -= v.trunc();
+        if v == 0.0 {
+            break;
+        }
+    }
+    format!("{int_s}{frac}")
+        .chars()
+        .filter(|c| *c != '0')
+        .collect()
+}
+
 // --- parsing helpers ---
 
 /// Lowercase chunk-name fragments likely to contain the given operations.
@@ -756,20 +943,88 @@ impl BookmarkMedia {
 
     /// Filename component, guaranteed not to escape its directory.
     ///
-    /// `tweet_id` arrives from a remote JSON document, and it used to be
-    /// interpolated straight into a path. A value of `../../evil` would have
-    /// written outside the download directory. X's ids are decimal snowflakes,
-    /// so anything else is either an attack or a parser change -- both worth
-    /// refusing rather than guessing at.
-    fn safe_stem(&self) -> Option<String> {
+    /// Reads as `2026-08-05_Lovable_what-the-shopping-cart-looks-like_2085…_0`:
+    /// date first so a folder sorts chronologically, then who posted it, then
+    /// enough of the text to recognise it, and only then the id. The id stays
+    /// because it is the only part that is unique -- two posts on one day by one
+    /// author with the same opening words are not hypothetical.
+    ///
+    /// Every component is built from remote JSON, so each is filtered down to a
+    /// known-safe alphabet rather than escaped. `tweet_id` in particular used to
+    /// be interpolated straight into a path, where `../../evil` would have
+    /// written outside the download directory; X's ids are decimal snowflakes,
+    /// so anything else is either an attack or a parser change, and both are
+    /// worth refusing rather than guessing at.
+    pub fn safe_stem(&self) -> Option<String> {
         if self.tweet_id.is_empty()
             || !self.tweet_id.bytes().all(|b| b.is_ascii_digit())
             || self.tweet_id.len() > 32
         {
             return None;
         }
-        Some(format!("x_{}_{}", self.tweet_id, self.index))
+
+        let mut parts: Vec<String> = Vec::with_capacity(5);
+        if !self.date.is_empty() {
+            parts.push(self.date.clone());
+        }
+        // X handles are already [A-Za-z0-9_], but this string came off the wire.
+        let author: String = self
+            .author
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(16)
+            .collect();
+        if !author.is_empty() {
+            parts.push(author);
+        }
+        let slug = slugify(&self.text, 48);
+        if !slug.is_empty() {
+            parts.push(slug);
+        }
+        parts.push(self.tweet_id.clone());
+        parts.push(self.index.to_string());
+        Some(parts.join("_"))
     }
+}
+
+/// Post text reduced to a lowercase hyphenated fragment of a filename.
+///
+/// Drops t.co links first: every post carrying media has one appended, and a
+/// name ending in `https-t-co-dkqjsuutu9` is noise where a description should
+/// be. Non-ASCII goes too -- emoji and CJK survive NTFS but not the round trip
+/// through archives, shells, and other people's machines that a reference
+/// library exists to feed.
+fn slugify(text: &str, max: usize) -> String {
+    let without_links: String = text
+        .split_whitespace()
+        .filter(|w| !w.starts_with("http://") && !w.starts_with("https://"))
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    let mut out = String::with_capacity(max);
+    let mut len = 0usize;
+    let mut pending_sep = false;
+    for c in without_links.chars() {
+        if !c.is_ascii_alphanumeric() {
+            // Any run of punctuation or space collapses to a single hyphen,
+            // and only when something actually follows it.
+            pending_sep = true;
+            continue;
+        }
+        // The separator counts towards the budget, or the result overruns by
+        // one whenever it lands on a word boundary.
+        let cost = 1 + usize::from(pending_sep && len > 0);
+        if len + cost > max {
+            break;
+        }
+        if pending_sep && len > 0 {
+            out.push('-');
+        }
+        pending_sep = false;
+        out.push(c.to_ascii_lowercase());
+        len += cost;
+    }
+    out.trim_matches('-').to_string()
 }
 
 /// Hosts X serves media from.
@@ -802,6 +1057,51 @@ fn is_twimg_host(url: &str) -> bool {
 /// claimed to be. Without a cap, a redirect to an endless response fills the
 /// disk with no natural stopping point.
 pub const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Why a bookmark walk ended.
+///
+/// Exists so the UI can tell "that is all there was" apart from "there is more,
+/// ask for more". Those look identical from a count alone, and confusing them
+/// is what makes a working sync feel like it is missing things.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StopReason {
+    /// Collected everything that was asked for. More may remain.
+    LimitReached,
+    /// Walked off the end of the bookmark list.
+    EndOfBookmarks,
+    /// Hit [`MAX_PAGES`].
+    PageCap,
+    /// Several consecutive pages fell entirely before the start date.
+    PastDateWindow,
+}
+
+impl StopReason {
+    /// A sentence for the person who ran the sync.
+    pub fn explain(&self) -> &'static str {
+        match self {
+            StopReason::LimitReached => "stopped at the number you asked for — there may be more",
+            StopReason::EndOfBookmarks => "reached the end of your bookmarks",
+            StopReason::PageCap => "stopped at the page limit — there may be more",
+            StopReason::PastDateWindow => "reached bookmarks older than the start date",
+        }
+    }
+
+    /// Whether asking again with a bigger number could return more.
+    pub fn more_available(&self) -> bool {
+        matches!(self, StopReason::LimitReached | StopReason::PageCap)
+    }
+}
+
+/// The result of walking bookmarks, with enough context to explain itself.
+pub struct Fetched {
+    pub items: Vec<BookmarkMedia>,
+    pub stop: StopReason,
+    /// Timeline pages requested.
+    pub pages: usize,
+    /// Posts looked at, including ones carrying no media.
+    pub posts_scanned: usize,
+}
 
 /// Which bookmarks to read.
 pub enum BookmarkSource {
@@ -844,11 +1144,30 @@ impl FetchOptions {
     }
 }
 
-/// `Sun Aug 02 11:34:55 +0000 2026` -> `2026-08-02`.
+/// A post's creation date as `YYYY-MM-DD`.
 ///
-/// Compared as strings: X always reports +0000, so lexicographic ordering on
+/// Accepts both forms X emits: `Sun Aug 02 11:34:55 +0000 2026` from the
+/// timeline API and `2026-08-05T16:42:18.000Z` from the embed endpoint. One
+/// parser rather than two, so a pasted link and a synced bookmark date-filter
+/// identically.
+///
+/// Compared as strings: X always reports UTC, so lexicographic ordering on
 /// `YYYY-MM-DD` is chronological and needs no date library.
 fn parse_created_at(created_at: &str) -> Option<String> {
+    // ISO 8601 already starts with the answer; validate rather than trust it.
+    if let Some(head) = created_at.get(..10) {
+        let b = head.as_bytes();
+        if b.len() == 10
+            && b[4] == b'-'
+            && b[7] == b'-'
+            && b.iter()
+                .enumerate()
+                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+        {
+            return Some(head.to_string());
+        }
+    }
+
     const MONTHS: [&str; 12] = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
     ];
@@ -1062,10 +1381,237 @@ mod tests {
                 "{hostile:?} was accepted as a filename component"
             );
         }
+    }
+
+    #[test]
+    fn a_filename_says_what_the_reference_is() {
+        let mut m = media("2085043732903301438");
+        m.author = "Lovable".into();
+        m.date = "2026-08-05".into();
+        m.text = "What should the shopping cart look like? https://t.co/DKQjsuutU9".into();
         assert_eq!(
-            media("1234567890").safe_stem().as_deref(),
-            Some("x_1234567890_0")
+            m.safe_stem().as_deref(),
+            Some(
+                "2026-08-05_Lovable_what-should-the-shopping-cart-look-like_2085043732903301438_0"
+            )
         );
+        // Date first, so a folder of these sorts chronologically.
+        assert!(m.safe_stem().unwrap().starts_with("2026-08-05"));
+    }
+
+    #[test]
+    fn a_filename_survives_posts_with_nothing_to_name_them_by() {
+        // Every optional part missing at once: no date, no author, no text.
+        let mut m = media("77");
+        m.author = String::new();
+        m.date = String::new();
+        m.text = String::new();
+        assert_eq!(m.safe_stem().as_deref(), Some("77_0"));
+
+        // Emoji-only text leaves no ASCII behind, which must not produce a
+        // stray separator or an empty component.
+        let mut e = media("88");
+        e.author = "someone".into();
+        e.date = "2026-01-02".into();
+        e.text = "🔥🔥🔥".into();
+        assert_eq!(e.safe_stem().as_deref(), Some("2026-01-02_someone_88_0"));
+    }
+
+    #[test]
+    fn a_slug_drops_links_and_collapses_punctuation() {
+        // A t.co link is appended to every post carrying media; naming files
+        // after it would describe nothing.
+        assert_eq!(
+            slugify("Look at this! https://t.co/abc", 48),
+            "look-at-this"
+        );
+        assert_eq!(slugify("a---b   c", 48), "a-b-c");
+        assert_eq!(slugify("!!!", 48), "");
+        // Bounded, and never left with a trailing separator.
+        let long = slugify(&"word ".repeat(40), 20);
+        assert!(long.chars().count() <= 20, "got {long:?}");
+        assert!(!long.ends_with('-'), "got {long:?}");
+        // Nothing that could steer a path or need quoting survives.
+        let hostile = slugify("../../etc/passwd; rm -rf ~", 48);
+        assert_eq!(hostile, "etc-passwd-rm-rf");
+    }
+
+    #[test]
+    fn a_page_keeps_collecting_past_a_post_older_than_the_window() {
+        // The regression this whole split exists for. X returns bookmarks in
+        // the order they were saved, not written: measured at 185 inversions
+        // across 791 consecutive bookmarks, the first seven items into page 1.
+        // The old code stopped the entire sync at that first old post.
+        let page: Vec<Value> = ["2026-08-11", "2026-08-10", "2026-06-25", "2026-08-07"]
+            .iter()
+            .enumerate()
+            .map(|(i, date)| dated_photo(i, date))
+            .collect();
+
+        let opts = FetchOptions {
+            limit: 100,
+            from: Some("2026-08-01".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let summary = collect_page(&page, &opts, &mut out);
+
+        assert_eq!(
+            out.len(),
+            3,
+            "the 2026-06-25 post must be skipped, not end the walk"
+        );
+        assert!(out.iter().all(|i| i.date.as_str() >= "2026-08-01"));
+        // The stop heuristic reads the newest post on the page, including ones
+        // the window rejected, so a jumbled page is judged by its best date.
+        assert_eq!(summary.newest.as_deref(), Some("2026-08-11"));
+    }
+
+    #[test]
+    fn a_page_entirely_before_the_window_reports_its_newest_date() {
+        // How the caller recognises it has walked past the start date. It has
+        // to be the newest on the page, or one stray recent post would reset
+        // the count forever.
+        let page: Vec<Value> = ["2024-03-01", "2024-05-02", "2024-01-01"]
+            .iter()
+            .enumerate()
+            .map(|(i, d)| dated_photo(i, d))
+            .collect();
+        let opts = FetchOptions {
+            limit: 100,
+            from: Some("2026-01-01".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let summary = collect_page(&page, &opts, &mut out);
+        assert!(out.is_empty());
+        assert_eq!(summary.newest.as_deref(), Some("2024-05-02"));
+    }
+
+    #[test]
+    fn an_upper_bound_skips_newer_posts_without_ending_the_walk() {
+        let page: Vec<Value> = ["2026-08-11", "2025-01-01", "2026-08-10"]
+            .iter()
+            .enumerate()
+            .map(|(i, d)| dated_photo(i, d))
+            .collect();
+        let opts = FetchOptions {
+            limit: 100,
+            to: Some("2025-06-01".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        collect_page(&page, &opts, &mut out);
+        assert_eq!(out.len(), 1, "only the 2025 post is inside the window");
+        assert_eq!(out[0].date, "2025-01-01");
+    }
+
+    #[test]
+    fn collecting_stops_at_the_limit_without_dropping_the_rest_of_a_post() {
+        let page: Vec<Value> = (0..5).map(|i| dated_photo(i, "2026-01-01")).collect();
+        let opts = FetchOptions {
+            limit: 3,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        collect_page(&page, &opts, &mut out);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn undated_posts_are_kept_rather_than_filtered_out() {
+        // A parsing gap must not silently cost references.
+        let tweet = serde_json::json!({
+            "legacy": { "id_str": "5", "extended_entities": { "media": [
+                { "type": "photo", "media_url_https": "https://pbs.twimg.com/media/A.jpg" }
+            ]}}
+        });
+        let opts = FetchOptions {
+            limit: 10,
+            from: Some("2026-01-01".into()),
+            to: Some("2026-12-31".into()),
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        let summary = collect_page(std::slice::from_ref(&tweet), &opts, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(summary.newest, None, "nothing dated the page");
+    }
+
+    /// A single-photo post on a given date.
+    fn dated_photo(i: usize, date: &str) -> Value {
+        serde_json::json!({
+            "legacy": {
+                "id_str": format!("{}", 1000 + i),
+                "created_at": format!("{date}T00:00:00.000Z"),
+                "extended_entities": { "media": [
+                    { "type": "photo",
+                      "media_url_https": format!("https://pbs.twimg.com/media/P{i}.jpg") }
+                ]}
+            }
+        })
+    }
+
+    #[test]
+    fn a_stop_reason_says_whether_asking_again_would_help() {
+        assert!(StopReason::LimitReached.more_available());
+        assert!(StopReason::PageCap.more_available());
+        // These two mean there is genuinely nothing more to fetch, and telling
+        // someone to "try a bigger number" would be a lie.
+        assert!(!StopReason::EndOfBookmarks.more_available());
+        assert!(!StopReason::PastDateWindow.more_available());
+    }
+
+    #[test]
+    fn an_embed_response_yields_the_same_media_as_a_timeline_one() {
+        // Shaped like the live response for the link that prompted this path.
+        let body = serde_json::json!({
+            "id_str": "2085043732903301438",
+            "created_at": "2026-08-05T16:42:18.000Z",
+            "text": "What should the shopping cart look like? https://t.co/DKQjsuutU9",
+            "user": { "screen_name": "Lovable" },
+            "mediaDetails": [{
+                "type": "video",
+                "media_url_https": "https://pbs.twimg.com/amplify_video_thumb/1/img/C.jpg",
+                "video_info": { "variants": [
+                    { "content_type": "application/x-mpegURL", "url": "https://x/p.m3u8" },
+                    { "content_type": "video/mp4", "bitrate": 632000, "url": "https://x/low.mp4" },
+                    { "content_type": "video/mp4", "bitrate": 10368000, "url": "https://x/4k.mp4" }
+                ]}
+            }]
+        });
+        let items = media_from_tweet(&syndication_to_legacy(&body));
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, BookmarkKind::Video);
+        // Same variant selection as a synced bookmark, which is the point of
+        // reshaping rather than writing a second extractor.
+        assert_eq!(items[0].media_url, "https://x/4k.mp4");
+        assert_eq!(items[0].author, "Lovable");
+        assert_eq!(items[0].date, "2026-08-05");
+        assert_eq!(
+            items[0].tweet_url,
+            "https://x.com/Lovable/status/2085043732903301438"
+        );
+        assert!(items[0].poster_url.is_some(), "no poster means no tile");
+    }
+
+    #[test]
+    fn the_embed_token_matches_what_x_generates() {
+        // Verified against the live endpoint for this id.
+        assert_eq!(syndication_token("2085043732903301438"), "51ycw2abihcskte");
+        // Never panics on input that is not an id; the caller rejects those
+        // first, but this must not be the thing that decides it.
+        assert_eq!(syndication_token("not-a-number"), "a");
+    }
+
+    #[test]
+    fn a_post_id_must_be_a_decimal_snowflake() {
+        for hostile in ["", "../x", "1e9", "12345678901234567890123456789012345"] {
+            assert!(
+                public_post(hostile).is_err(),
+                "{hostile:?} was accepted as a post id"
+            );
+        }
     }
 
     #[test]

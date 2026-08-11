@@ -47,14 +47,21 @@ fn main() {
         limit,
         ..Default::default()
     };
-    let items = match client.fetch_bookmarks(&specs[0], &BookmarkSource::All, &opts) {
+    let walk = match client.fetch_bookmarks(&specs[0], &BookmarkSource::All, &opts) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("  {e}");
             std::process::exit(1);
         }
     };
-    println!("  {} item(s)", items.len());
+    let items = walk.items;
+    println!(
+        "  {} item(s) from {} post(s) over {} page(s) -- {}",
+        items.len(),
+        walk.posts_scanned,
+        walk.pages,
+        walk.stop.explain()
+    );
 
     // The question this probe exists to answer: does a video entity carry a
     // poster image? If not, a linked video reference has no thumbnail and the

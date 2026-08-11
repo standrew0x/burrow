@@ -126,11 +126,14 @@ pub struct FailedImport {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct ImportReport {
     pub imported: Vec<AssetRow>,
     /// Files skipped because their digest was already in the library, including
     /// duplicates within this same batch.
     pub duplicates: usize,
+    /// Skipped because they had been deleted from the library before.
+    pub dismissed: usize,
     pub failed: Vec<FailedImport>,
 }
 
@@ -561,7 +564,15 @@ pub fn import_links(
     let mut seen: HashSet<String> = HashSet::new();
     {
         let mut exists = conn.prepare("SELECT 1 FROM assets WHERE remote_url = ?1")?;
+        let mut was_dismissed = conn.prepare("SELECT 1 FROM dismissed WHERE remote_url = ?1")?;
         for link in links {
+            // Thrown away on purpose once already. Counted rather than silently
+            // dropped: a skip nobody can see is the same as a sync that lost
+            // things, which is exactly the complaint this feature answers.
+            if was_dismissed.exists(rusqlite::params![&link.media_url])? {
+                report.dismissed += 1;
+                continue;
+            }
             // Same URL twice in one batch, or already in the library.
             let already = !seen.insert(link.media_url.clone())
                 || exists.exists(rusqlite::params![&link.media_url])?;
@@ -815,10 +826,14 @@ fn materialize(
     // reference still streams, so a failure here costs a retry, not a tile.
     std::fs::rename(&staging, &dest).map_err(|e| Error::io(&dest, e))?;
 
+    // `remote_url` is kept, not cleared. `state` already records that the bytes
+    // are held locally, and the URL is what tells a later sync "you already
+    // have this". Clearing it meant downloading a reference made the next sync
+    // add it back as a second, linked copy of something already on disk.
     conn.execute(
         "UPDATE assets
             SET state = ?1, content_hash = ?2, bytes = ?3, width = ?4,
-                height = ?5, duration_ms = ?6, kind = ?7, remote_url = NULL
+                height = ?5, duration_ms = ?6, kind = ?7
           WHERE id = ?8",
         rusqlite::params![
             AssetState::Local.as_str(),
@@ -924,6 +939,9 @@ fn describe_downloaded(path: &Path) -> Result<Downloaded> {
 pub struct DeleteReport {
     pub deleted: usize,
     pub bytes_freed: i64,
+    /// How many of the deleted references were remembered, so a later sync
+    /// will not offer them again.
+    pub dismissed: usize,
     /// Rows removed whose blob or thumbnail could not be unlinked -- usually a
     /// file lock. The reference is gone from the library either way; this is
     /// wasted disk, not a broken tile.
@@ -950,22 +968,45 @@ pub fn delete_assets(
 
     // Collect what to unlink before the rows disappear.
     let mut doomed: Vec<(String, String, i64)> = Vec::with_capacity(asset_ids.len());
+    // And what to remember having thrown away.
+    let mut tombstones: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     {
-        let mut stmt = conn.prepare("SELECT hash, ext, bytes FROM assets WHERE id = ?1")?;
+        let mut stmt = conn.prepare(
+            "SELECT hash, ext, bytes, remote_url, source_url, original_name
+               FROM assets WHERE id = ?1",
+        )?;
         for id in asset_ids {
             let mut rows = stmt.query([id])?;
             if let Some(r) = rows.next()? {
                 doomed.push((r.get(0)?, r.get(1)?, r.get(2)?));
+                // Only references with a remote identity get a tombstone. A
+                // dropped local import has nothing to be recognised by later,
+                // and re-adding a file you dragged in again is a deliberate act
+                // that should simply work.
+                if let Some(remote) = r.get::<_, Option<String>>(3)? {
+                    tombstones.push((remote, r.get(4)?, r.get(5)?));
+                }
             }
         }
     }
 
+    let dismissed_at = now_unix();
     let tx = conn.transaction()?;
     {
         // Swatches and board memberships cascade from the asset row.
         let mut stmt = tx.prepare("DELETE FROM assets WHERE id = ?1")?;
         for id in asset_ids {
             report.deleted += stmt.execute([id])?;
+        }
+    }
+    {
+        let mut stmt = tx.prepare(
+            "INSERT OR REPLACE INTO dismissed (remote_url, page_url, title, dismissed_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        for (remote, page, title) in &tombstones {
+            stmt.execute(rusqlite::params![remote, page, title, dismissed_at])?;
+            report.dismissed += 1;
         }
     }
     tx.commit()?;
@@ -986,6 +1027,58 @@ pub fn delete_assets(
     }
 
     Ok(report)
+}
+
+/// A reference that was deleted and will not be offered again.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Dismissed {
+    pub remote_url: String,
+    pub page_url: Option<String>,
+    pub title: Option<String>,
+    pub dismissed_at: i64,
+}
+
+/// Everything currently being skipped, newest first.
+///
+/// This list has to be visible somewhere. A rule that silently withholds
+/// results is indistinguishable from a broken sync, and an accidental delete
+/// would otherwise be permanent with no way to find out why.
+pub fn list_dismissed(conn: &Connection, limit: i64) -> Result<Vec<Dismissed>> {
+    let mut stmt = conn.prepare(
+        "SELECT remote_url, page_url, title, dismissed_at
+           FROM dismissed ORDER BY dismissed_at DESC, remote_url LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit], |r| {
+        Ok(Dismissed {
+            remote_url: r.get(0)?,
+            page_url: r.get(1)?,
+            title: r.get(2)?,
+            dismissed_at: r.get(3)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Stops skipping some references, or all of them when `urls` is empty.
+///
+/// Undoing a tombstone does not restore anything by itself; it makes the next
+/// sync offer the reference again, which is the only sense in which a deleted
+/// reference can come back.
+pub fn undismiss(conn: &mut Connection, urls: &[String]) -> Result<usize> {
+    if urls.is_empty() {
+        return Ok(conn.execute("DELETE FROM dismissed", [])?);
+    }
+    let tx = conn.transaction()?;
+    let mut removed = 0usize;
+    {
+        let mut stmt = tx.prepare("DELETE FROM dismissed WHERE remote_url = ?1")?;
+        for url in urls {
+            removed += stmt.execute([url])?;
+        }
+    }
+    tx.commit()?;
+    Ok(removed)
 }
 
 /// Most recently imported first.
@@ -1368,6 +1461,74 @@ mod tests {
     }
 
     #[test]
+    fn a_deleted_reference_does_not_come_back_on_the_next_sync() {
+        // Otherwise "delete" means "delete until you sync again", which is not
+        // what anybody means by delete.
+        let mut fx = Fixture::new("dismiss-resync");
+        let url = "https://video.twimg.com/gone.mp4";
+
+        let first = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(url, MediaKind::Video, [9, 9, 9, 255])],
+        )
+        .expect("import");
+        let id = first.imported[0].id;
+
+        let deleted = delete_assets(&fx.lib, &mut fx.conn, &[id]).expect("delete");
+        assert_eq!(deleted.deleted, 1);
+        assert_eq!(deleted.dismissed, 1, "the URL was not remembered");
+
+        // The same bookmark comes round again on the next sync.
+        let second = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(url, MediaKind::Video, [9, 9, 9, 255])],
+        )
+        .expect("import");
+        assert!(second.imported.is_empty(), "a deleted reference came back");
+        assert_eq!(
+            second.dismissed, 1,
+            "the skip must be counted, not silent -- an invisible skip is \
+             indistinguishable from a sync that lost things"
+        );
+        assert_eq!(second.duplicates, 0, "a tombstone is not a duplicate");
+
+        // And it can be taken back, or the first misclick is permanent.
+        let listed = list_dismissed(&fx.conn, 10).expect("list");
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].remote_url, url);
+        assert_eq!(undismiss(&mut fx.conn, &[url.to_string()]).unwrap(), 1);
+
+        let third = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(url, MediaKind::Video, [9, 9, 9, 255])],
+        )
+        .expect("import");
+        assert_eq!(third.imported.len(), 1, "undismiss did not restore syncing");
+    }
+
+    #[test]
+    fn deleting_a_local_import_leaves_no_tombstone() {
+        // A dragged-in file has no remote identity, and dragging it in again is
+        // a deliberate act that must simply work.
+        let mut fx = Fixture::new("dismiss-local");
+        let path = fx.write_png("local.png", 8, 8, [4, 4, 4, 255]);
+        let imported =
+            import_paths(&fx.lib, &mut fx.conn, std::slice::from_ref(&path)).expect("import");
+        let id = imported.imported[0].id;
+
+        let report = delete_assets(&fx.lib, &mut fx.conn, &[id]).expect("delete");
+        assert_eq!(report.deleted, 1);
+        assert_eq!(report.dismissed, 0);
+        assert!(list_dismissed(&fx.conn, 10).unwrap().is_empty());
+
+        let again = import_paths(&fx.lib, &mut fx.conn, &[path]).expect("re-import");
+        assert_eq!(again.imported.len(), 1, "a re-added file was refused");
+    }
+
+    #[test]
     fn colour_search_reaches_linked_references() {
         // The reason a link stores a thumbnail at all rather than just a URL.
         let mut fx = Fixture::new("link-colour");
@@ -1434,9 +1595,14 @@ mod tests {
             a.duration_ms.unwrap_or(0) > 0,
             "duration should be known once the file is real"
         );
+        // The URL is kept. `state` is what says the bytes are held locally;
+        // the URL is what lets a later sync recognise this bookmark as already
+        // in the library. Clearing it meant downloading a reference caused the
+        // next sync to add it back as a second, linked copy of the same thing.
         assert_eq!(
-            a.remote_url, None,
-            "a downloaded reference should stop advertising a remote source"
+            a.remote_url.as_deref(),
+            Some("https://video.twimg.com/real.mp4"),
+            "a downloaded reference must still know where it came from"
         );
 
         // No staging file left beside the blob.

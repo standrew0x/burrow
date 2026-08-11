@@ -39,7 +39,29 @@ impl Library {
     /// Known Folder Move redirects those, and a redirected library means every
     /// imported blob gets uploaded to a cloud the user did not opt into --
     /// which defeats the point of a local-first tool.
+    /// `BURROW_LIBRARY` overrides the location entirely.
+    ///
+    /// Exists so a second copy of the app can be run against a scratch library
+    /// rather than the real one -- verifying a change used to mean opening the
+    /// live library in a second process and migrating it underneath whatever
+    /// was already running. It doubles as the escape hatch for anyone who wants
+    /// their library on another drive.
     pub fn default_root() -> Result<PathBuf> {
+        Self::root_from(std::env::var_os("BURROW_LIBRARY"))
+    }
+
+    /// The override taken as an argument rather than read here, so the choice
+    /// can be tested without writing a process-global environment variable that
+    /// every other test in the binary would race against.
+    fn root_from(override_path: Option<std::ffi::OsString>) -> Result<PathBuf> {
+        if let Some(path) = override_path {
+            let path = PathBuf::from(path);
+            // An empty value is how a shell spells "unset"; honouring it would
+            // put the library at the filesystem root.
+            if !path.as_os_str().is_empty() {
+                return Ok(path);
+            }
+        }
         dirs::data_local_dir()
             .map(|d| d.join(Self::IDENTIFIER))
             .ok_or(Error::NoLibraryDir)
@@ -183,7 +205,9 @@ mod tests {
     /// `$INSTDIR` and took `burrow.db` with it, leaving every blob orphaned.
     #[test]
     fn library_root_cannot_collide_with_the_installer() {
-        let root = Library::default_root().expect("a local data dir");
+        // `root_from(None)` rather than `default_root()`, so this asserts the
+        // default location even on a machine where BURROW_LIBRARY is set.
+        let root = Library::root_from(None).expect("a local data dir");
         let leaf = root
             .file_name()
             .and_then(|n| n.to_str())
@@ -199,6 +223,17 @@ mod tests {
             "library root {leaf:?} matches the NSIS install directory \
              ($LOCALAPPDATA\\<ProductName>); installing would delete the database"
         );
+    }
+
+    #[test]
+    fn an_override_relocates_the_library_but_an_empty_one_does_not() {
+        let custom = Library::root_from(Some("D:/refs/burrow".into())).expect("override");
+        assert_eq!(custom, PathBuf::from("D:/refs/burrow"));
+
+        // An empty variable is how a shell spells "unset". Taking it literally
+        // would put the library at the filesystem root.
+        let blank = Library::root_from(Some("".into())).expect("blank falls back");
+        assert_eq!(blank, Library::root_from(None).unwrap());
     }
 
     #[test]

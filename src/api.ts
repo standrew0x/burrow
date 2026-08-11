@@ -5,6 +5,7 @@ import type {
   Board,
   ColorMatch,
   DeleteReport,
+  Dismissed,
   DownloadReport,
   ImportReport,
   SyncOptions,
@@ -96,9 +97,22 @@ export const setNote = (assetId: number, note: string) =>
 export const searchNotes = (query: string, limit?: number) =>
   invoke<Asset[]>("search_notes", { query, limit });
 
-/** Permanent: removes the rows and unlinks the stored files. */
+/**
+ * Permanent: removes the rows and unlinks the stored files.
+ *
+ * References that came from a URL are also remembered, so a later sync does not
+ * offer them again — otherwise "delete" means "delete until you sync".
+ */
 export const deleteAssets = (assetIds: number[]) =>
   invoke<DeleteReport>("delete_assets", { assetIds });
+
+/** References being kept out of future syncs because they were deleted. */
+export const listDismissed = (limit?: number) =>
+  invoke<Dismissed[]>("list_dismissed", { limit });
+
+/** Allows deleted references to be offered again. Empty list clears them all. */
+export const undismiss = (urls: string[]) =>
+  invoke<number>("undismiss", { urls });
 
 /**
  * Adds references from pasted URLs. Only a preview image is fetched; the media

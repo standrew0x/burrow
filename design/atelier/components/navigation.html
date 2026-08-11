@@ -1,0 +1,68 @@
+<!-- @dsCard group="Components" name="Navigation & notices" subtitle="Top bar, sidebar, banners, table" viewport="760x640" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Navigation &amp; notices</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 740px; margin: 0 auto; padding: var(--space-4) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.frame { border: 1px solid var(--color-divider); background: var(--color-surface); }
+.split { display: grid; grid-template-columns: 200px 1fr; }
+.side { padding: var(--space-3); border-right: 1px solid var(--color-divider); }
+.body { padding: var(--space-4); }
+.stack { display: grid; gap: var(--space-3); }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head" style="margin-top:0">Shell</h6>
+  <div class="frame">
+    <nav class="nav">
+      <span class="nav-brand">Burrow</span>
+      <a href="#" aria-current="page">Library</a>
+      <a href="#">Boards</a>
+      <a href="#">Dismissed</a>
+    </nav>
+    <div class="split">
+      <div class="side">
+        <h6 style="margin:0 0 var(--space-2)">Boards</h6>
+        <div class="sidenav">
+          <button type="button" aria-current="true">All references <span class="text-muted" style="margin-left:auto">116</span></button>
+          <button type="button">Title cards <span class="text-muted" style="margin-left:auto">14</span></button>
+          <button type="button">Water &amp; glass <span class="text-muted" style="margin-left:auto">31</span></button>
+          <button type="button">Undergrowth <span class="text-muted" style="margin-left:auto">8</span></button>
+        </div>
+      </div>
+      <div class="body stack">
+        <div class="notice">
+          <div><strong>38 imported</strong> &middot; 4 images, 34 videos &middot; from all bookmarks
+            <div class="text-muted" style="font-size:13px">Reached bookmarks older than the start date &middot; 397 posts over 4 pages.</div>
+          </div>
+        </div>
+        <div class="notice notice-alert">
+          <div><strong>3 skipped</strong> &mdash; you deleted these before.
+            <div class="text-muted" style="font-size:13px">Clear them from Dismissed to let them sync again.</div>
+          </div>
+        </div>
+        <table class="table">
+          <thead><tr><th>Reference</th><th>Size</th><th>State</th></tr></thead>
+          <tbody>
+            <tr><td>Harbour at dusk</td><td class="text-mono">3840&times;2160</td><td><span class="tag tag-accent">Linked</span></td></tr>
+            <tr><td>Studio wall, warm</td><td class="text-mono">2048&times;1536</td><td><span class="tag tag-neutral">Local</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <hr class="hr" />
+  <p class="note">The active board is marked by an inset olive edge and a tint, never by a filled block — a solid selection bar in a sidebar full of thumbnails becomes the brightest thing on screen.</p>
+  <p class="note">Notices carry a second line of detail rather than a number alone. "38 imported" cannot tell you whether there are more; "reached bookmarks older than the start date" can.</p>
+</main>
+</body>
+</html>

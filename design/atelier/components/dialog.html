@@ -1,0 +1,64 @@
+<!-- @dsCard group="Components" name="Dialog & cards" subtitle="Confirmation, card grid, elevation" viewport="700x600" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Dialog &amp; cards</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 680px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.demo-head:first-child { margin-top: 0; }
+.stage { position: relative; height: 300px; border: 1px solid var(--color-divider); overflow: hidden; background: var(--color-neutral-200); }
+.stage .dialog-backdrop { position: absolute; }
+.grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-3); }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head">Confirmation</h6>
+  <div class="stage">
+    <div class="dialog-backdrop">
+      <div class="dialog">
+        <h4 class="dialog-title">Delete 3 references?</h4>
+        <p class="dialog-body">The stored files and thumbnails are erased, and they are removed from every board. Your originals on disk are not touched.</p>
+        <p class="dialog-body text-muted" style="margin:0">Because these came from X, they will also be kept out of future syncs — you can undo that from Dismissed.</p>
+        <div class="dialog-actions">
+          <button type="button" class="btn btn-secondary">Cancel</button>
+          <button type="button" class="btn btn-danger">Delete</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <h6 class="demo-head">Cards</h6>
+  <div class="grid-3">
+    <div class="card">
+      <span class="card-kicker">Board</span>
+      <span class="card-title">Title cards</span>
+      <p class="card-body">Type treatments pulled from film openings.</p>
+      <span class="card-meta">14 references</span>
+    </div>
+    <div class="card elev-sm">
+      <span class="card-kicker">Board</span>
+      <span class="card-title">Water &amp; glass</span>
+      <p class="card-body">Refraction, caustics, wet surfaces.</p>
+      <span class="card-meta">31 references</span>
+    </div>
+    <div class="card elev-md">
+      <span class="card-kicker">Board</span>
+      <span class="card-title">Undergrowth</span>
+      <p class="card-body">Greens that hold up under a grade.</p>
+      <span class="card-meta">8 references</span>
+    </div>
+  </div>
+
+  <hr class="hr" />
+  <p class="note">The dialog is the only surface in the system with real elevation, and it earns it by being the only one that blocks. Its olive top edge is the same device the sidebar uses for the active item — one accent stripe, meaning "this is the thing in play".</p>
+  <p class="note">A destructive dialog states the second-order consequence too. Deleting a synced reference also stops it coming back, and finding that out later feels like the sync broke.</p>
+</main>
+</body>
+</html>

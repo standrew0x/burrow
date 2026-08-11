@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Atelier</title>
+<link rel="stylesheet" href="styles.css" />
+<style>
+body { display: grid; place-items: center; height: 100vh; margin: 0; }
+.card-face { width: 420px; padding: var(--space-6); background: var(--color-surface); border: 1px solid var(--color-divider); border-top: 2px solid var(--color-accent); }
+.ramp { display: flex; height: 12px; margin-top: var(--space-4); }
+.ramp span { flex: 1; }
+</style>
+</head>
+<body>
+  <div class="card-face">
+    <h6 style="margin:0 0 var(--space-2)">Design system</h6>
+    <h2 style="margin:0">Atelier</h2>
+    <p class="text-muted" style="margin:var(--space-2) 0 0; font-size:14px">
+      Warm paper, ink, hairlines and air — so the imagery is the loudest thing on screen.
+    </p>
+    <div class="ramp">
+      <span style="background:#f6f3ed"></span><span style="background:#e2ddd2"></span>
+      <span style="background:#7a6a3f"></span><span style="background:#a4552f"></span>
+      <span style="background:#1f1c17"></span>
+    </div>
+  </div>
+</body>
+</html>

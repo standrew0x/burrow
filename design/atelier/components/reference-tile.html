@@ -1,0 +1,80 @@
+<!-- @dsCard group="Components" name="Reference tile" subtitle="Plate, palette edge, handwritten note, corner flag" viewport="760x620" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Reference tile</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 740px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.demo-head:first-child { margin-top: 0; }
+.grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: var(--space-4); align-items: start; }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+/* Stand-in imagery: the real tiles carry photographs. */
+.shot { aspect-ratio: 4 / 3; }
+.shot-a { background: linear-gradient(150deg, #6f8fa8, #2e4356 60%, #c2a68a); }
+.shot-b { background: linear-gradient(200deg, #d8cbb4, #8a6f4e 70%, #33291d); }
+.shot-c { background: linear-gradient(30deg, #1e2a24, #4c6b52 50%, #b8c9a4); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head">Tiles</h6>
+  <div class="grid">
+
+    <figure class="tile">
+      <div class="tile-media">
+        <div class="shot shot-a"></div>
+        <span class="tile-flag">Linked</span>
+      </div>
+      <figcaption class="tile-body">
+        <span class="tile-name">Harbour at dusk</span>
+        <span class="tile-meta">3840&times;2160 &middot; streams</span>
+      </figcaption>
+      <p class="tile-note">The blue I keep coming back to. Grade the water, not the sky.</p>
+      <div class="tile-palette">
+        <span style="background:#2e4356;flex:3"></span><span style="background:#6f8fa8;flex:2"></span>
+        <span style="background:#c2a68a;flex:1"></span><span style="background:#0f171e;flex:1"></span>
+      </div>
+    </figure>
+
+    <figure class="tile">
+      <div class="tile-media"><div class="shot shot-b"></div></div>
+      <figcaption class="tile-body">
+        <span class="tile-name">Studio wall, warm</span>
+        <span class="tile-meta">2048&times;1536 &middot; 1.4 MB</span>
+      </figcaption>
+      <div class="tile-palette">
+        <span style="background:#d8cbb4;flex:3"></span><span style="background:#8a6f4e;flex:2"></span>
+        <span style="background:#33291d;flex:2"></span>
+      </div>
+    </figure>
+
+    <figure class="tile">
+      <div class="tile-media">
+        <div class="shot shot-c"></div>
+        <span class="tile-flag tile-flag-alt">Video</span>
+      </div>
+      <figcaption class="tile-body">
+        <span class="tile-name">Undergrowth, 2:14</span>
+        <span class="tile-meta">1920&times;1080 &middot; 41.2 MB</span>
+      </figcaption>
+      <p class="tile-note">Reference for the transition — hold on the green before the cut.</p>
+      <div class="tile-palette">
+        <span style="background:#4c6b52;flex:3"></span><span style="background:#1e2a24;flex:2"></span>
+        <span style="background:#b8c9a4;flex:1"></span>
+      </div>
+    </figure>
+
+  </div>
+
+  <hr class="hr" />
+  <p class="note">The extracted palette is a permanent strip along the bottom edge rather than something revealed on hover. It is what the library searches on, so hiding it would hide the index — and at 10px it reads as a colour signature without competing with the plate above it.</p>
+  <p class="note">Notes are set in the serif italic. Everything a person wrote looks handwritten against the machine-set filename and dimensions directly above, which is the whole reason the system carries two families.</p>
+  <p class="note"><strong>No grayscale.</strong> The system's image treatment is deliberately none: this library is searched by colour, so desaturating the plates would break the tool it dresses.</p>
+</main>
+</body>
+</html>

@@ -171,49 +171,20 @@ fn client() -> Result<reqwest::blocking::Client> {
 
 /// Resolves a pasted URL.
 ///
-/// `x` is the authenticated X client, when one is configured. X post URLs need
-/// it -- the media lives behind the timeline API, not in the page's meta tags,
-/// because the page is a JavaScript shell. Without a session those links fall
-/// through to the generic path, which still finds a preview image.
-pub fn resolve(url: &str, x: Option<&crate::xsync::XClient>) -> Result<Resolved> {
+/// Needs no X session, including for x.com links: everything here reads public
+/// endpoints with a cookieless client.
+pub fn resolve(url: &str) -> Result<Resolved> {
     let parsed = check_fetchable(url)?;
 
     // A link to a single X post.
     //
-    // There is no working way to read one as of this writing, and the fallbacks
-    // were each measured rather than assumed:
-    //
-    //   * the timeline API has no single-post operation left. Enumerating every
-    //     GraphQL operation in X's web bundle -- 623 chunks -- turned up no
-    //     `TweetResultByRestId`, no `TweetDetail`, nothing that fetches a post
-    //     by id.
-    //   * the page itself returns 404 to anything that is not X's own web app,
-    //     including Chrome, Googlebot, Twitterbot and facebookexternalhit, so
-    //     there are no OpenGraph tags to read either.
-    //   * cdn.syndication.twimg.com, which used to serve embeds publicly, 404s
-    //     with or without a valid token.
-    //
-    // The attempt is still made, so this starts working again by itself if X
-    // restores an operation. When it fails the message points at the path that
-    // does work rather than reporting a GraphQL detail nobody can act on.
+    // Not the timeline API: it has no single-post operation left. Every GraphQL
+    // operation in X's web bundle was enumerated -- 630 chunks, 191 operations
+    // -- and none reads a post by id; `TweetResultByRestId` and `TweetDetail`
+    // are both gone. The embed endpoint is a separate public service and still
+    // answers, which is why this needs no session.
     if let Some(status_id) = x_status_id(&parsed) {
-        if let Some(client) = x {
-            match resolve_x_post(&parsed, &status_id, client) {
-                Ok(resolved) => return Ok(resolved),
-                Err(e) => {
-                    return Err(Error::Link(format!(
-                        "X no longer lets anything but its own web app read a single post, so this \
-                         link cannot be added directly. Bookmark it on X and use Sync from X, which \
-                         still works. ({e})"
-                    )))
-                }
-            }
-        }
-        return Err(Error::Link(
-            "Connect your X account to add posts, then bookmark this one on X and use Sync from X \
-             — single post links cannot be read without a session."
-                .into(),
-        ));
+        return resolve_x_post(&parsed, &status_id);
     }
 
     let http = client()?;
@@ -460,18 +431,20 @@ fn x_status_id(url: &reqwest::Url) -> Option<String> {
     }
 }
 
-fn resolve_x_post(
-    url: &reqwest::Url,
-    status_id: &str,
-    x: &crate::xsync::XClient,
-) -> Result<Resolved> {
-    let items = x.tweet_media(status_id)?;
+/// Turns an x.com post URL into a reference.
+///
+/// The poster comes back over the ordinary link client, not the X session one:
+/// it is a public image on a public CDN, and the fewer requests that carry a
+/// login the better.
+fn resolve_x_post(url: &reqwest::Url, status_id: &str) -> Result<Resolved> {
+    let items = crate::xsync::public_post(status_id)?;
     let item = items
         .into_iter()
         .next()
         .ok_or_else(|| Error::Link(format!("{url} has no image or video attached")))?;
 
-    let thumbnail = x.fetch_thumbnail(&item)?;
+    let http = client()?;
+    let thumbnail = get_capped(&http, item.thumbnail_source(), MAX_IMAGE_BYTES)?;
     Ok(Resolved {
         page_url: item.tweet_url.clone(),
         media_url: item.media_url.clone(),

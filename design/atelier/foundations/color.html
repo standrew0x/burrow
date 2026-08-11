@@ -1,0 +1,67 @@
+<!-- @dsCard group="Foundations" name="Colour" subtitle="Warm paper, ink, olive and clay ramps" viewport="720x620" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Colour</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 700px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.demo-head:first-child { margin-top: 0; }
+.ramp { display: grid; grid-template-columns: repeat(9, 1fr); border: 1px solid var(--color-divider); }
+.ramp span { height: 46px; display: grid; place-items: end center; padding-bottom: 4px; font-family: var(--font-mono); font-size: 9px; }
+.roles { display: grid; grid-template-columns: repeat(2, 1fr); gap: var(--space-3); }
+.role { display: flex; align-items: center; gap: var(--space-3); }
+.chip { width: 44px; height: 44px; flex: none; border: 1px solid var(--color-divider); }
+.role code { display: block; font-family: var(--font-mono); font-size: 11px; }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head">Roles</h6>
+  <div class="roles">
+    <div class="role"><span class="chip" style="background:#f6f3ed"></span><div><strong>Background</strong><code>#f6f3ed</code></div></div>
+    <div class="role"><span class="chip" style="background:#fffdf9"></span><div><strong>Surface</strong><code>#fffdf9</code></div></div>
+    <div class="role"><span class="chip" style="background:#1f1c17"></span><div><strong>Text</strong><code>#1f1c17</code></div></div>
+    <div class="role"><span class="chip" style="background:#7a6a3f"></span><div><strong>Accent · olive</strong><code>#7a6a3f</code></div></div>
+    <div class="role"><span class="chip" style="background:#a4552f"></span><div><strong>Accent 2 · clay</strong><code>#a4552f</code></div></div>
+    <div class="role"><span class="chip" style="background:color-mix(in srgb,#1f1c17 14%,transparent)"></span><div><strong>Divider</strong><code>ink @ 14%</code></div></div>
+  </div>
+
+  <h6 class="demo-head">Neutral</h6>
+  <div class="ramp">
+    <span style="background:#faf8f4">100</span><span style="background:#f0ece4">200</span>
+    <span style="background:#e2ddd2">300</span><span style="background:#cdc6b8">400</span>
+    <span style="background:#b0a898">500</span><span style="background:#918978">600</span>
+    <span style="background:#726a5b;color:#faf8f4">700</span><span style="background:#544d41;color:#faf8f4">800</span>
+    <span style="background:#35302a;color:#faf8f4">900</span>
+  </div>
+
+  <h6 class="demo-head">Accent — olive</h6>
+  <div class="ramp">
+    <span style="background:#f7f4e9">100</span><span style="background:#ece5cd">200</span>
+    <span style="background:#ddd1a8">300</span><span style="background:#c4b47c">400</span>
+    <span style="background:#a89453">500</span><span style="background:#7a6a3f;color:#faf8f4">600</span>
+    <span style="background:#5e5230;color:#faf8f4">700</span><span style="background:#443b23;color:#faf8f4">800</span>
+    <span style="background:#2c2718;color:#faf8f4">900</span>
+  </div>
+
+  <h6 class="demo-head">Accent 2 — clay</h6>
+  <div class="ramp">
+    <span style="background:#fdf1ea">100</span><span style="background:#f8ddcc">200</span>
+    <span style="background:#f0c0a3">300</span><span style="background:#e29a71">400</span>
+    <span style="background:#cd7448">500</span><span style="background:#a4552f;color:#fdf1ea">600</span>
+    <span style="background:#7f4023;color:#fdf1ea">700</span><span style="background:#5b2e19;color:#fdf1ea">800</span>
+    <span style="background:#3a1e11;color:#fdf1ea">900</span>
+  </div>
+
+  <hr class="hr" />
+  <p class="note">Every hue in the system sits between 20&deg; and 60&deg; — paper, olive, clay. That is deliberate: this palette dresses a library of other people's photographs, and a saturated or cool interface colour competes with the imagery for the eye. Clay is the only note allowed to raise its voice, and it is reserved for destructive actions and alerts.</p>
+  <p class="note">Both ramps are generated on one shared lightness scale, so accent-600 and neutral-600 carry the same visual weight and can be swapped without re-checking contrast.</p>
+</main>
+</body>
+</html>

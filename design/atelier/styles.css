@@ -1,0 +1,384 @@
+/* Atelier — design-system tokens and component classes. This file is the source
+   of truth for the system's look; retune it here and see readme.md.
+
+   The premise: a reference library is a working surface, not a showroom. Warm
+   paper, ink, hairlines, and a lot of air — the chrome behaves like the page of
+   a binder, and the imagery pinned to it supplies every strong colour on
+   screen. Nothing in the interface is allowed to be the loudest thing.
+
+   Class names deliberately match the Modernist system (.btn, .input, .card,
+   .tag, .nav, .table, .dialog, .seg), so the same markup can wear either. */
+
+@import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=Instrument+Sans:wght@400;500;600&display=swap');
+
+:root {
+  --color-bg: #f6f3ed;
+  --color-surface: #fffdf9;
+  --color-text: #1f1c17;
+  --color-accent: #7a6a3f;
+  --color-accent-2: #a4552f;
+
+  /* Hairline, not a rule. Modernist separates with weight; Atelier separates
+     with space, and the line is only there to confirm the edge. */
+  --color-divider: color-mix(in srgb, #1f1c17 14%, transparent);
+  --color-divider-strong: color-mix(in srgb, #1f1c17 28%, transparent);
+
+  /* Tonal ramps — warm-tinted neutrals on one shared lightness scale, so the
+     same step of any role matches the others in visual value. */
+  --color-neutral-100: #faf8f4;
+  --color-neutral-200: #f0ece4;
+  --color-neutral-300: #e2ddd2;
+  --color-neutral-400: #cdc6b8;
+  --color-neutral-500: #b0a898;
+  --color-neutral-600: #918978;
+  --color-neutral-700: #726a5b;
+  --color-neutral-800: #544d41;
+  --color-neutral-900: #35302a;
+
+  --color-accent-100: #f7f4e9;
+  --color-accent-200: #ece5cd;
+  --color-accent-300: #ddd1a8;
+  --color-accent-400: #c4b47c;
+  --color-accent-500: #a89453;
+  --color-accent-600: #7a6a3f;
+  --color-accent-700: #5e5230;
+  --color-accent-800: #443b23;
+  --color-accent-900: #2c2718;
+
+  --color-accent-2-100: #fdf1ea;
+  --color-accent-2-200: #f8ddcc;
+  --color-accent-2-300: #f0c0a3;
+  --color-accent-2-400: #e29a71;
+  --color-accent-2-500: #cd7448;
+  --color-accent-2-600: #a4552f;
+  --color-accent-2-700: #7f4023;
+  --color-accent-2-800: #5b2e19;
+  --color-accent-2-900: #3a1e11;
+
+  --font-heading: "Fraunces", Georgia, "Times New Roman", serif;
+  --font-heading-weight: 600;
+  --font-body: "Instrument Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
+
+  /* Density 1.25: the steps are wider than a default scale because air is the
+     system's main separator. Tightening these is the fastest way to make
+     Atelier stop looking like Atelier. */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 14px;
+  --space-4: 20px;
+  --space-6: 32px;
+  --space-8: 48px;
+
+  /* Not zero and not round. 2px reads as a cut edge rather than a styled
+     corner — the paper is trimmed, not moulded. */
+  --radius-sm: 2px;
+  --radius-md: 2px;
+  --radius-lg: 3px;
+
+  /* Elevation is nearly absent by design. Things sit on the page; they do not
+     hover above it. Only the dialog gets real depth. */
+  --shadow-sm: 0 1px 2px color-mix(in srgb, #35302a 8%, transparent);
+  --shadow-md: 0 4px 16px color-mix(in srgb, #35302a 10%, transparent);
+  --shadow-lg: 0 16px 44px color-mix(in srgb, #35302a 18%, transparent);
+}
+
+*, *::before, *::after { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--color-bg);
+  color: var(--color-text);
+  font-family: var(--font-body);
+  font-size: 15px;
+  line-height: 1.6;
+  font-weight: 400;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, h4, h5, h6 {
+  font-family: var(--font-heading);
+  font-weight: var(--font-heading-weight);
+  line-height: 1.15;
+  letter-spacing: -0.012em;
+  margin: 0 0 var(--space-3);
+}
+h1 { font-size: 44px; }
+h2 { font-size: 34px; }
+h3 { font-size: 26px; }
+h4 { font-size: 20px; }
+h5 { font-size: 16px; }
+h6 {
+  font-family: var(--font-body);
+  font-size: 12px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+}
+
+p { margin: 0 0 var(--space-3); }
+a { color: var(--color-accent); text-underline-offset: 3px; }
+img { display: block; max-width: 100%; }
+figure { margin: 0; }
+figcaption {
+  font-family: var(--font-heading);
+  font-size: 13px; font-style: italic;
+  margin-top: var(--space-2);
+  color: color-mix(in srgb, var(--color-text) 62%, transparent);
+}
+.text-muted { color: color-mix(in srgb, var(--color-text) 55%, transparent); }
+.text-mono { font-family: var(--font-mono); font-size: 0.92em; }
+
+:focus { outline: none; }
+:focus-visible { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+::selection { background: var(--color-accent-200); }
+
+/* — rules — */
+.hr {
+  height: 1px; border: 0; margin: var(--space-6) 0;
+  background: var(--color-divider);
+}
+/* The one heavy rule in the system, for the top of a section. Used sparingly,
+   it does the work that a whole scale of rule weights would otherwise need. */
+.hr-strong { height: 2px; background: var(--color-text); margin: var(--space-4) 0; }
+
+/* — images —
+   No grayscale filter, and that is a decision rather than an omission. This
+   system dresses a colour-reference library whose search is built on the
+   palette of each image; desaturating the plates would defeat the tool it is
+   for. Images are framed instead: a hairline and a paper mat. */
+.plate {
+  padding: var(--space-2);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-md);
+}
+.plate img { border-radius: 1px; }
+
+/* — buttons — */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+  cursor: pointer; text-decoration: none;
+  font-family: var(--font-body); font-weight: 500;
+  font-size: 14px; line-height: 1.2; color: var(--color-text);
+  background: transparent; border: 1px solid transparent;
+  padding: var(--space-2) var(--space-4);
+  border-radius: var(--radius-md);
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+.btn svg { display: block; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-primary { background: var(--color-accent); color: var(--color-surface); }
+.btn-primary:hover:not(:disabled) { background: var(--color-accent-700); }
+.btn-primary:active:not(:disabled) { background: var(--color-accent-800); }
+
+.btn-secondary { border-color: var(--color-divider-strong); }
+.btn-secondary:hover:not(:disabled) { background: var(--color-neutral-200); border-color: var(--color-text); }
+
+.btn-ghost { color: var(--color-accent-700); }
+.btn-ghost:hover:not(:disabled) { background: var(--color-accent-100); }
+
+/* Destructive borrows accent-2 rather than introducing a fourth hue. */
+.btn-danger { color: var(--color-accent-2-700); border-color: var(--color-accent-2-300); }
+.btn-danger:hover:not(:disabled) { background: var(--color-accent-2-600); color: var(--color-surface); border-color: transparent; }
+
+.btn-icon { width: 34px; height: 34px; padding: 0; }
+.btn-block { width: 100%; margin-top: var(--space-2); }
+.btn-sm { padding: 5px var(--space-3); font-size: 13px; }
+
+/* — forms — */
+.field > label {
+  display: block; font-size: 12px; font-weight: 500; margin-bottom: 6px;
+  letter-spacing: 0.04em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 58%, transparent);
+}
+.input {
+  width: 100%; min-height: 36px; padding: 7px 11px; font: inherit;
+  font-size: 14px; color: var(--color-text); caret-color: var(--color-accent);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider); border-radius: var(--radius-md);
+  transition: border-color 120ms ease;
+}
+.input:hover { border-color: var(--color-divider-strong); }
+.input:focus-visible { border-color: var(--color-accent); outline-offset: 0; }
+.input::placeholder { color: var(--color-neutral-500); }
+textarea.input { min-height: 92px; resize: vertical; line-height: 1.55; }
+select.input { cursor: pointer; }
+
+.radio { display: inline-flex; align-items: center; gap: 9px; cursor: pointer; font-size: 14px; }
+.radio input, .seg-opt input {
+  position: absolute; opacity: 0; width: 0; height: 0; pointer-events: none;
+}
+.radio .dot {
+  width: 15px; height: 15px; flex: none; border-radius: 50%;
+  border: 1px solid var(--color-divider-strong);
+}
+.radio:hover .dot { border-color: var(--color-accent); }
+.radio input:checked + .dot {
+  border-color: var(--color-accent); background: var(--color-accent);
+  box-shadow: inset 0 0 0 3.5px var(--color-surface);
+}
+.radio input:focus-visible + .dot { outline: 2px solid var(--color-accent); outline-offset: 2px; }
+
+.seg {
+  display: inline-flex; overflow: hidden;
+  border: 1px solid var(--color-divider-strong); border-radius: var(--radius-md);
+}
+.seg-opt {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px var(--space-3); font-size: 13px; cursor: pointer;
+}
+.seg-opt + .seg-opt { border-left: 1px solid var(--color-divider); }
+.seg-opt:has(input:checked) { background: var(--color-text); color: var(--color-bg); }
+.seg-opt:not(:has(input:checked)):hover { background: var(--color-neutral-200); }
+.seg-opt:has(input:focus-visible) { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+
+/* — cards — */
+.card {
+  display: flex; flex-direction: column; gap: var(--space-2);
+  padding: var(--space-4);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-md);
+  background: var(--color-surface);
+}
+.card-kicker {
+  font-size: 11px; font-weight: 600; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--color-accent-700);
+}
+.card-title {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 19px; line-height: 1.2;
+}
+.card-body { margin: 0; font-size: 14px; color: color-mix(in srgb, var(--color-text) 72%, transparent); flex: 1; }
+.card-meta {
+  display: flex; align-items: center; gap: 8px; font-size: 12px;
+  color: color-mix(in srgb, var(--color-text) 50%, transparent);
+}
+.elev-sm { box-shadow: var(--shadow-sm); }
+.elev-md { box-shadow: var(--shadow-md); }
+.elev-lg { box-shadow: var(--shadow-lg); }
+
+/* — tags — */
+.tag {
+  display: inline-flex; align-items: center; font-size: 11px; font-weight: 500;
+  letter-spacing: 0.06em; text-transform: uppercase; padding: 3px 9px;
+  border-radius: var(--radius-sm);
+}
+.tag-accent { background: var(--color-accent-200); color: var(--color-accent-800); }
+.tag-accent-2 { background: var(--color-accent-2-200); color: var(--color-accent-2-800); }
+.tag-neutral { background: var(--color-neutral-200); color: var(--color-neutral-800); }
+.tag-outline { border: 1px solid var(--color-accent); color: var(--color-accent-700); }
+
+/* — navigation — */
+.nav {
+  display: flex; align-items: center; gap: var(--space-6);
+  padding: var(--space-3) var(--space-6);
+  border-bottom: 1px solid var(--color-divider);
+}
+.nav-brand {
+  font-family: var(--font-heading); font-weight: 700;
+  font-size: 20px; letter-spacing: -0.02em; margin-right: auto;
+}
+.nav a {
+  color: color-mix(in srgb, var(--color-text) 70%, transparent);
+  text-decoration: none; font-size: 14px;
+  padding-bottom: 2px; border-bottom: 1px solid transparent;
+}
+.nav a:hover { color: var(--color-text); }
+.nav a[aria-current='page'] { color: var(--color-text); border-bottom-color: var(--color-accent); }
+
+/* Vertical navigation, for app shells with a permanent sidebar. */
+.sidenav { display: flex; flex-direction: column; gap: 1px; }
+.sidenav a, .sidenav button {
+  display: flex; align-items: center; gap: var(--space-2);
+  padding: 7px var(--space-2); border: 0; background: none;
+  font: inherit; font-size: 14px; text-align: left; cursor: pointer;
+  color: color-mix(in srgb, var(--color-text) 72%, transparent);
+  text-decoration: none; border-radius: var(--radius-sm);
+}
+.sidenav a:hover, .sidenav button:hover { background: var(--color-neutral-200); color: var(--color-text); }
+.sidenav [aria-current='true'], .sidenav [aria-current='page'] {
+  background: var(--color-accent-100); color: var(--color-text); font-weight: 500;
+  box-shadow: inset 2px 0 0 var(--color-accent);
+}
+
+/* — tables — */
+.table { width: 100%; border-collapse: collapse; font-size: 14px; }
+.table th {
+  text-align: left; font-size: 11px; font-weight: 600;
+  letter-spacing: 0.1em; text-transform: uppercase;
+  color: color-mix(in srgb, var(--color-text) 55%, transparent);
+  padding: var(--space-2) var(--space-3); border-bottom: 1px solid var(--color-text);
+}
+.table td { padding: var(--space-3); border-bottom: 1px solid var(--color-divider); }
+.table tbody tr:hover { background: var(--color-neutral-100); }
+
+/* — dialog — */
+.dialog-backdrop {
+  position: fixed; inset: 0; display: grid; place-items: center;
+  padding: var(--space-4);
+  background: color-mix(in srgb, var(--color-neutral-900) 42%, transparent);
+}
+.dialog {
+  width: min(460px, 100%); display: flex; flex-direction: column; gap: var(--space-3);
+  padding: var(--space-6); border-radius: var(--radius-lg);
+  background: var(--color-surface); box-shadow: var(--shadow-lg);
+  border-top: 2px solid var(--color-accent);
+}
+.dialog-title {
+  font-family: var(--font-heading); font-weight: var(--font-heading-weight);
+  font-size: 22px;
+}
+.dialog-body { font-size: 14px; color: color-mix(in srgb, var(--color-text) 75%, transparent); }
+.dialog-actions { display: flex; justify-content: flex-end; gap: var(--space-2); margin-top: var(--space-2); }
+
+/* — notices — */
+.notice {
+  display: flex; align-items: flex-start; gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider);
+  border-left: 2px solid var(--color-accent);
+  border-radius: var(--radius-md);
+  font-size: 14px;
+}
+.notice-alert { border-left-color: var(--color-accent-2-600); background: var(--color-accent-2-100); }
+
+/* — reference tile —
+   The system's one app-specific component: a pinned plate with its extracted
+   palette along the bottom edge. The palette is part of the artefact, not
+   decoration, so it is always visible rather than revealed on hover. */
+.tile {
+  display: flex; flex-direction: column;
+  background: var(--color-surface);
+  border: 1px solid var(--color-divider);
+  border-radius: var(--radius-md);
+}
+.tile:hover { border-color: var(--color-divider-strong); }
+.tile-media { position: relative; line-height: 0; background: var(--color-neutral-200); }
+.tile-media img { width: 100%; height: auto; }
+.tile-body { padding: var(--space-3); display: flex; flex-direction: column; gap: 3px; }
+.tile-name {
+  font-family: var(--font-heading); font-size: 15px; line-height: 1.25;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.tile-meta {
+  font-size: 11px; letter-spacing: 0.04em;
+  font-family: var(--font-mono);
+  color: color-mix(in srgb, var(--color-text) 50%, transparent);
+}
+.tile-note {
+  margin: 0; padding: 0 var(--space-3) var(--space-3);
+  font-family: var(--font-heading); font-style: italic; font-size: 13.5px;
+  line-height: 1.5; color: color-mix(in srgb, var(--color-text) 78%, transparent);
+}
+.tile-palette { display: flex; height: 10px; }
+.tile-palette span { flex: 1; }
+/* A corner tab, the way a physical reference gets a flag stuck to it. */
+.tile-flag {
+  position: absolute; top: 0; right: 0;
+  padding: 3px 8px; font-size: 10px; font-weight: 600;
+  letter-spacing: 0.08em; text-transform: uppercase;
+  background: var(--color-accent); color: var(--color-surface);
+}
+.tile-flag-alt { background: var(--color-accent-2-600); }

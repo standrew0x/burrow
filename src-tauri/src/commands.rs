@@ -194,6 +194,23 @@ pub fn search_notes(
     )
 }
 
+/// References that were deleted and are being kept out of future syncs.
+#[tauri::command]
+pub fn list_dismissed(
+    state: tauri::State<'_, AppState>,
+    limit: Option<i64>,
+) -> Result<Vec<crate::ingest::Dismissed>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::list_dismissed(&conn, limit.unwrap_or(DEFAULT_PAGE_SIZE))
+}
+
+/// Lets deleted references be offered again. Empty `urls` clears the whole list.
+#[tauri::command]
+pub fn undismiss(state: tauri::State<'_, AppState>, urls: Vec<String>) -> Result<usize> {
+    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::undismiss(&mut conn, &urls)
+}
+
 /// Permanently deletes references and their stored files.
 #[tauri::command]
 pub fn delete_assets(
@@ -208,6 +225,13 @@ pub fn delete_assets(
 
 const DEFAULT_SYNC_LIMIT: usize = 50;
 
+/// Ceiling on a single sync, whatever the UI asks for.
+///
+/// "Everything" is a legitimate request, but it still has to terminate: each
+/// item costs a poster fetch, so an unbounded run over a large bookmark list is
+/// thousands of HTTP requests with no way to tell it has not hung.
+const MAX_SYNC_LIMIT: usize = 5000;
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct SyncReport {
@@ -218,8 +242,22 @@ pub struct SyncReport {
     pub downloaded: usize,
     pub imported: usize,
     pub duplicates: usize,
+    /// Skipped because they were deleted from the library before.
+    pub dismissed: usize,
     pub images: usize,
     pub videos: usize,
+    /// Why the walk ended, in a sentence.
+    ///
+    /// Present because a count on its own cannot distinguish "that is all your
+    /// bookmarks hold" from "there is more, ask for more" -- and mistaking the
+    /// second for the first is what makes a working sync feel lossy.
+    pub stopped_because: String,
+    /// Whether asking for a larger number could return more.
+    pub more_available: bool,
+    /// Timeline pages read.
+    pub pages: usize,
+    /// Posts examined, including ones carrying no media at all.
+    pub posts_scanned: usize,
     pub failed: Vec<crate::ingest::FailedImport>,
 }
 
@@ -252,7 +290,11 @@ pub async fn sync_from_x(
     let library_root = state.library.root().to_path_buf();
     let kinds = kinds.unwrap_or_else(|| "all".to_string());
     let opts = crate::xsync::FetchOptions {
-        limit: limit.unwrap_or(DEFAULT_SYNC_LIMIT),
+        // 0 is how the UI says "everything"; it still gets a ceiling.
+        limit: match limit.unwrap_or(DEFAULT_SYNC_LIMIT) {
+            0 => MAX_SYNC_LIMIT,
+            n => n.min(MAX_SYNC_LIMIT),
+        },
         from: from.filter(|s| !s.is_empty()),
         to: to.filter(|s| !s.is_empty()),
         include_images: kinds != "videos",
@@ -298,8 +340,15 @@ pub async fn sync_from_x(
             }
         };
 
-        let items = client.fetch_bookmarks(&spec, &source, &opts)?;
+        let walk = client.fetch_bookmarks(&spec, &source, &opts)?;
+        let items = walk.items;
         let found = items.len();
+        let stats = WalkStats {
+            stopped_because: walk.stop.explain().to_string(),
+            more_available: walk.stop.more_available(),
+            pages: walk.pages,
+            posts_scanned: walk.posts_scanned,
+        };
         let mut failed = Vec::new();
 
         if !download {
@@ -328,6 +377,7 @@ pub async fn sync_from_x(
                 found,
                 links,
                 failed,
+                stats,
             });
         }
 
@@ -339,7 +389,11 @@ pub async fn sync_from_x(
         let mut downloaded = Vec::new();
         for item in &items {
             match client.download(item, &staging) {
-                Ok(p) => downloaded.push((p, item.tweet_url.clone())),
+                Ok(path) => downloaded.push(FromX {
+                    path,
+                    page_url: item.tweet_url.clone(),
+                    media_url: item.media_url.clone(),
+                }),
                 Err(e) => failed.push(crate::ingest::FailedImport {
                     path: item.tweet_url.clone(),
                     reason: e.to_string(),
@@ -352,6 +406,7 @@ pub async fn sync_from_x(
             downloaded,
             failed,
             staging,
+            stats,
         })
     })
     .await
@@ -363,6 +418,7 @@ pub async fn sync_from_x(
             found,
             links,
             mut failed,
+            stats,
         } => {
             let offered = links.len();
             let mut report = {
@@ -379,8 +435,13 @@ pub async fn sync_from_x(
                 downloaded: offered,
                 imported: report.imported.len(),
                 duplicates: report.duplicates,
+                dismissed: report.dismissed,
                 images,
                 videos: report.imported.len() - images,
+                stopped_because: stats.stopped_because,
+                more_available: stats.more_available,
+                pages: stats.pages,
+                posts_scanned: stats.posts_scanned,
                 failed,
             })
         }
@@ -390,24 +451,32 @@ pub async fn sync_from_x(
             downloaded,
             mut failed,
             staging,
+            stats,
         } => {
             let files: Vec<std::path::PathBuf> =
-                downloaded.iter().map(|(p, _)| p.clone()).collect();
+                downloaded.iter().map(|d| d.path.clone()).collect();
             let mut report = {
                 let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
                 ingest::import_paths(&state.library, &mut conn, &files)?
             };
 
-            // Record where each one came from, so a tile can lead back to the post.
+            // Record where each one came from, so a tile can lead back to the
+            // post -- and so a later link-mode sync recognises it as already
+            // held. Without `remote_url` the same bookmark comes back as a
+            // second, linked copy of a file that is already on disk.
             {
                 let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-                let mut stmt = conn.prepare("UPDATE assets SET source_url = ?1 WHERE id = ?2")?;
+                let mut stmt = conn
+                    .prepare("UPDATE assets SET source_url = ?1, remote_url = ?2 WHERE id = ?3")?;
                 for asset in &report.imported {
                     let name = asset.original_name.clone().unwrap_or_default();
-                    if let Some((_, url)) = downloaded.iter().find(|(p, _)| {
-                        p.file_name().map(|f| f.to_string_lossy() == name.as_str()) == Some(true)
+                    if let Some(d) = downloaded.iter().find(|d| {
+                        d.path
+                            .file_name()
+                            .map(|f| f.to_string_lossy() == name.as_str())
+                            == Some(true)
                     }) {
-                        stmt.execute(rusqlite::params![url, asset.id])?;
+                        stmt.execute(rusqlite::params![d.page_url, d.media_url, asset.id])?;
                     }
                 }
             }
@@ -423,12 +492,34 @@ pub async fn sync_from_x(
                 downloaded: files.len(),
                 imported: report.imported.len(),
                 duplicates: report.duplicates,
+                dismissed: report.dismissed,
                 images,
                 videos: report.imported.len() - images,
+                stopped_because: stats.stopped_because,
+                more_available: stats.more_available,
+                pages: stats.pages,
+                posts_scanned: stats.posts_scanned,
                 failed,
             })
         }
     }
+}
+
+/// One downloaded bookmark and the two URLs that identify it.
+struct FromX {
+    path: std::path::PathBuf,
+    /// The post, for leading a tile back to where it came from.
+    page_url: String,
+    /// The media file, which is what dedup and tombstones key on.
+    media_url: String,
+}
+
+/// How far the bookmark walk got, carried through to the report.
+struct WalkStats {
+    stopped_because: String,
+    more_available: bool,
+    pages: usize,
+    posts_scanned: usize,
 }
 
 /// What the blocking half of a sync produced.
@@ -438,13 +529,15 @@ enum Fetched {
         found: usize,
         links: Vec<crate::ingest::PendingLink>,
         failed: Vec<crate::ingest::FailedImport>,
+        stats: WalkStats,
     },
     Files {
         label: String,
         found: usize,
-        downloaded: Vec<(std::path::PathBuf, String)>,
+        downloaded: Vec<FromX>,
         failed: Vec<crate::ingest::FailedImport>,
         staging: std::path::PathBuf,
+        stats: WalkStats,
     },
 }
 
@@ -474,25 +567,16 @@ fn describe_post(item: &crate::xsync::BookmarkMedia) -> String {
 
 /// Adds references from pasted URLs, fetching only a preview image.
 ///
-/// X post links go through the authenticated client, which can read the media
-/// out of the timeline API; everything else is resolved from its OpenGraph
-/// tags. The two use different HTTP clients on purpose -- see [`crate::link`].
+/// X post links read the public embed endpoint; everything else is resolved
+/// from its OpenGraph tags. Neither needs the X session, so this works before
+/// the account is connected -- see [`crate::link`].
 #[tauri::command]
 pub async fn add_links(
     state: tauri::State<'_, AppState>,
     urls: Vec<String>,
 ) -> Result<ImportReport> {
-    let library_root = state.library.root().to_path_buf();
-
     let (links, failed) = tauri::async_runtime::spawn_blocking(
         move || -> (Vec<crate::ingest::PendingLink>, Vec<crate::ingest::FailedImport>) {
-            // An X session is optional. Without one, x.com links still resolve
-            // through OpenGraph -- worse metadata, but a working tile.
-            let x = crate::store::Library::open(&library_root)
-                .ok()
-                .and_then(|lib| crate::xsync::XSession::load(&lib).ok())
-                .and_then(|session| crate::xsync::XClient::new(session).ok());
-
             let mut links = Vec::new();
             let mut failed = Vec::new();
             for url in urls {
@@ -500,7 +584,7 @@ pub async fn add_links(
                 if url.is_empty() {
                     continue;
                 }
-                match crate::link::resolve(&url, x.as_ref()) {
+                match crate::link::resolve(&url) {
                     Ok(r) => links.push(crate::ingest::PendingLink {
                         page_url: r.page_url,
                         media_url: r.media_url,

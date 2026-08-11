@@ -131,6 +131,27 @@ const MIGRATIONS: &[&str] = &[
     r#"
     ALTER TABLE assets ADD COLUMN note TEXT;
     "#,
+    // --- v6: dismissed references ---
+    //
+    // A reference deleted on purpose should not come back on the next sync.
+    // Without this, "delete" means "delete until you sync again", which is not
+    // what anybody means by delete.
+    //
+    // Keyed on the remote URL, so only references that came from somewhere have
+    // a tombstone. A local file has no such identity, and hashing its contents
+    // instead would mean deleting an import silently blocks re-adding the same
+    // file later -- there, re-adding is a deliberate act that should just work.
+    //
+    // `page_url` and `title` are kept purely so the list can be shown to a
+    // person who wants to undo one; nothing reads them to make a decision.
+    r#"
+    CREATE TABLE dismissed (
+        remote_url   TEXT PRIMARY KEY,
+        page_url     TEXT,
+        title        TEXT,
+        dismissed_at INTEGER NOT NULL
+    );
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.
@@ -395,6 +416,69 @@ mod tests {
         assert_eq!(state, "linked", "the reference stopped being a link");
         assert_eq!(remote.as_deref(), Some("https://video.twimg.com/a.mp4"));
         assert_eq!(note, None);
+    }
+
+    #[test]
+    fn a_v5_library_upgrades_and_starts_with_nothing_dismissed() {
+        // The upgrade a real 0.5.0 library takes. Tombstones must arrive empty:
+        // references already in the library predate the feature and must not be
+        // treated as things the user threw away.
+        let conn = Connection::open_in_memory().unwrap();
+        configure(&conn).unwrap();
+        for (i, sql) in MIGRATIONS.iter().enumerate().take(5) {
+            conn.execute_batch(&format!(
+                "BEGIN;\n{sql}\nPRAGMA user_version = {};\nCOMMIT;",
+                i + 1
+            ))
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO assets
+                (hash, ext, mime, width, height, bytes, imported_at, state, remote_url, note)
+             VALUES ('keep','mp4','video/mp4',16,9,0,0,'linked','https://video.twimg.com/a.mp4','mine')",
+            [],
+        )
+        .unwrap();
+
+        migrate(&conn).expect("upgrade v5 -> latest");
+
+        let dismissed: i64 = conn
+            .query_row("SELECT count(*) FROM dismissed", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(dismissed, 0);
+        let note: Option<String> = conn
+            .query_row("SELECT note FROM assets WHERE hash='keep'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(note.as_deref(), Some("mine"), "the note did not survive");
+    }
+
+    #[test]
+    fn a_url_can_only_be_dismissed_once() {
+        // Deleting the same reference twice -- deleted, re-synced after an
+        // undismiss, deleted again -- must not fail on the second write.
+        let conn = open_in_memory().expect("open");
+        let sql = "INSERT OR REPLACE INTO dismissed (remote_url, page_url, title, dismissed_at)
+                   VALUES ('https://video.twimg.com/a.mp4', ?1, ?2, ?3)";
+        conn.execute(
+            sql,
+            rusqlite::params!["https://x.com/a/status/1", "first", 10],
+        )
+        .unwrap();
+        conn.execute(
+            sql,
+            rusqlite::params!["https://x.com/a/status/1", "second", 20],
+        )
+        .expect("re-dismissing the same URL must not fail");
+
+        let (title, at): (String, i64) = conn
+            .query_row("SELECT title, dismissed_at FROM dismissed", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(title, "second", "the later dismissal should win");
+        assert_eq!(at, 20);
     }
 
     #[test]

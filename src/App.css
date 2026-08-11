@@ -458,6 +458,107 @@ button:focus-visible {
   word-break: break-all;
 }
 
+/* Why a sync stopped. On its own line rather than appended to the counts: it is
+   the part that answers "is that everything?", and buried mid-sentence it reads
+   as more statistics. */
+.banner__why {
+  flex-basis: 100%;
+  margin-top: 3px;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.banner__why b {
+  color: var(--accent);
+}
+
+/* ---------- dismissed references ---------- */
+
+.dismissed {
+  max-width: 820px;
+  padding: 20px;
+}
+
+.dismissed__lede {
+  margin: 0 0 16px;
+  max-width: 66ch;
+  color: var(--ink-dim);
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.dismissed__bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 8px;
+  color: var(--ink-dim);
+  font-size: 12px;
+}
+
+.dismissed__list {
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  list-style: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+}
+
+.dismissed__row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 9px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--line);
+}
+
+.dismissed__row:last-child {
+  border-bottom: none;
+}
+
+.dismissed__text {
+  flex: 1;
+  min-width: 0;
+}
+
+.dismissed__title {
+  display: block;
+  overflow: hidden;
+  font-size: 13px;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dismissed__url {
+  display: block;
+  overflow: hidden;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 11px;
+  color: var(--ink-dim);
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+.dismissed__bar button,
+.dismissed__row button {
+  flex: none;
+  padding: 5px 10px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.dismissed__bar button:hover,
+.dismissed__row button:hover {
+  border-color: var(--accent);
+}
+
 /* Indeterminate: the import command is synchronous and reports nothing until it
    returns, so a percentage here would be a lie. */
 .progress {

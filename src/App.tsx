@@ -15,7 +15,9 @@ import {
   listAssets,
   listBoardAssets,
   listBoards,
+  listDismissed,
   moveToBoard,
+  undismiss,
   playbackUrl,
   removeFromBoard,
   renameBoard,
@@ -29,7 +31,14 @@ import {
   xFolders,
   xStatus,
 } from "./api";
-import type { Asset, Board, FailedImport, SyncKinds, XStatus } from "./types";
+import type {
+  Asset,
+  Board,
+  Dismissed,
+  FailedImport,
+  SyncKinds,
+  XStatus,
+} from "./types";
 import "./App.css";
 
 interface Notice {
@@ -46,6 +55,18 @@ interface Notice {
   downloaded?: number;
   bytesWritten?: number;
   deduplicated?: number;
+  /** Skipped because they were deleted from the library before. */
+  dismissed?: number;
+  /**
+   * Why a sync stopped, and whether asking for more would return more.
+   *
+   * A count on its own cannot tell those two apart, and reading "38 imported"
+   * as "that is all there was" when it was really "that is all you asked for"
+   * is exactly what makes a working sync feel like it is losing things.
+   */
+  stoppedBecause?: string;
+  moreAvailable?: boolean;
+  scanned?: string;
 }
 
 /** Anything that looks like a link the app could resolve. */
@@ -67,12 +88,19 @@ function urlsIn(text: string): string[] {
 
 /** Batch sizes offered next to the Sync button.
  *
- *  Measured at roughly 26s per video end to end (download plus poster-frame
- *  extraction), so 50 would block the window for ~20 minutes. The source folder
- *  holds ~500 videos at ~2.3GB; syncing is deliberately a slice you choose,
- *  not an all-or-nothing operation. */
-const SYNC_BATCH_OPTIONS = [5, 10, 25, 50, 100] as const;
-const DEFAULT_SYNC_BATCH = 10;
+ *  These are presets, not the limit — the box beside them takes any number, and
+ *  0 means everything. A fixed menu is what made a large bookmark collection
+ *  feel permanently truncated: measured against the real account, the timeline
+ *  holds ~1500 media items, so a menu topping out at 100 could never reach most
+ *  of it.
+ *
+ *  Cost differs enormously by mode. Linking fetches one poster per item and is
+ *  quick; downloading measured ~26s per video end to end, so a few hundred
+ *  videos is hours. That is why link-only is the default. */
+const SYNC_BATCH_OPTIONS = [10, 25, 50, 100, 250, 500] as const;
+const DEFAULT_SYNC_BATCH = 25;
+/** Matches MAX_SYNC_LIMIT in commands.rs; keep the two in step. */
+const MAX_SYNC_BATCH = 5000;
 
 /** OkLab search radius. See DEFAULT_COLOR_TOLERANCE in commands.rs for how
  *  this number was picked; keep the two in step. */
@@ -137,6 +165,9 @@ export default function App() {
   const [noteFilter, setNoteFilter] = useState<string | null>(null);
   const [addingLinks, setAddingLinks] = useState(false);
   const [syncDownload, setSyncDownload] = useState(false);
+  /** Viewing the tombstone list rather than any set of references. */
+  const [showDismissed, setShowDismissed] = useState(false);
+  const [dismissed, setDismissed] = useState<Dismissed[]>([]);
   /** Ids currently being fetched, so their tiles can show it. */
   const [downloading, setDownloading] = useState<Set<number>>(new Set());
 
@@ -294,6 +325,10 @@ export default function App() {
         setNotice({
           imported: report.imported.length,
           duplicates: report.duplicates,
+          // Without this, pasting a link you deleted earlier reports a bare
+          // "0 imported" and looks broken, which is the whole failure mode
+          // tombstones were supposed to avoid rather than create.
+          dismissed: report.dismissed,
           failed: report.failed,
         });
         setLinkInput("");
@@ -414,7 +449,32 @@ export default function App() {
     setHexInput("");
     setNoteFilter(null);
     setNoteQuery("");
+    setShowDismissed(false);
     clearSelection();
+  };
+
+  const refreshDismissed = useCallback(async () => {
+    try {
+      setDismissed(await listDismissed(500));
+    } catch (e) {
+      setError(String(e));
+    }
+  }, []);
+
+  const openDismissed = async () => {
+    setShowDismissed(true);
+    clearSelection();
+    await refreshDismissed();
+  };
+
+  /** Lets a reference be offered by sync again. Does not restore it by itself. */
+  const allowAgain = async (urls: string[]) => {
+    try {
+      await undismiss(urls);
+      await refreshDismissed();
+    } catch (e) {
+      setError(String(e));
+    }
   };
 
   const runSync = async () => {
@@ -437,10 +497,16 @@ export default function App() {
       setNotice({
         imported: report.imported,
         duplicates: report.duplicates,
+        dismissed: report.dismissed,
         failed: report.failed,
         syncedFrom: `${report.source} · ${report.found} found`,
         images: report.images,
         videos: report.videos,
+        stoppedBecause: report.stoppedBecause,
+        moreAvailable: report.moreAvailable,
+        scanned: `${report.postsScanned} posts over ${report.pages} page${
+          report.pages === 1 ? "" : "s"
+        }`,
       });
       setSyncOpen(false);
       await refresh();
@@ -514,12 +580,25 @@ export default function App() {
   /** The only irreversible action in the app, so it states exactly what goes. */
   const deleteSelection = async () => {
     const count = selected.size;
+    const plural = count === 1 ? "" : "s";
+    // How many of these will also stop being offered by future syncs. Stated up
+    // front: finding out later that deleting quietly changed what sync returns
+    // is indistinguishable from the sync breaking.
+    const fromSource = assets.filter(
+      (a) => selected.has(a.id) && (a.remoteUrl || a.sourceUrl),
+    ).length;
     const confirmed = window.confirm(
-      `Permanently delete ${count} reference${count === 1 ? "" : "s"}?\n\n` +
-        `The stored file${count === 1 ? "" : "s"} and thumbnail${count === 1 ? "" : "s"} ` +
-        `will be erased from your library, and ${count === 1 ? "it" : "they"} will be ` +
-        `removed from every board.\n\nYour original file${count === 1 ? "" : "s"} on disk ` +
-        `${count === 1 ? "is" : "are"} not touched. This cannot be undone.`,
+      `Permanently delete ${count} reference${plural}?\n\n` +
+        `The stored file${plural} and thumbnail${plural} will be erased from your ` +
+        `library, and ${count === 1 ? "it" : "they"} will be removed from every ` +
+        `board.\n\nYour original file${plural} on disk ${count === 1 ? "is" : "are"} ` +
+        `not touched. This cannot be undone.` +
+        (fromSource > 0
+          ? `\n\n${fromSource} of these came from a link or from X, so ${
+              fromSource === 1 ? "it" : "they"
+            } will also be kept out of future syncs. You can undo that under ` +
+            `Dismissed in the sidebar.`
+          : ""),
     );
     if (!confirmed) return;
 
@@ -534,6 +613,7 @@ export default function App() {
           reason: "row deleted, but the file could not be unlinked",
         })),
         deleted: report.deleted,
+        dismissed: report.dismissed,
         bytesFreed: report.bytesFreed,
       });
       await refresh();
@@ -544,6 +624,9 @@ export default function App() {
   };
 
   const heading = useMemo(() => {
+    if (showDismissed) {
+      return `${dismissed.length} kept out of sync`;
+    }
     if (loading) return "Loading library…";
     if (importingCount !== null) {
       return `Importing ${importingCount} file${importingCount === 1 ? "" : "s"}…`;
@@ -554,17 +637,40 @@ export default function App() {
     if (noteFilter) return `${assets.length} noting “${noteFilter}”`;
     if (colorFilter) return `${assets.length} matching ${colorFilter}`;
     return `${assets.length} reference${assets.length === 1 ? "" : "s"}`;
-  }, [loading, importingCount, activeBoard, colorFilter, noteFilter, assets.length]);
+  }, [
+    loading,
+    importingCount,
+    activeBoard,
+    colorFilter,
+    noteFilter,
+    assets.length,
+    showDismissed,
+    dismissed.length,
+  ]);
 
   return (
     <div className={`app${dragging ? " app--dragging" : ""}`}>
       <aside className="rail">
         <button
           type="button"
-          className={`rail__item${activeBoardId === null ? " rail__item--active" : ""}`}
+          className={`rail__item${
+            activeBoardId === null && !showDismissed ? " rail__item--active" : ""
+          }`}
           onClick={() => showBoard(null)}
         >
           <span className="rail__name">All references</span>
+        </button>
+
+        {/* Deliberately always visible, not only when non-empty. A rule that
+            silently withholds sync results has to be findable before you know
+            to go looking for it. */}
+        <button
+          type="button"
+          className={`rail__item${showDismissed ? " rail__item--active" : ""}`}
+          onClick={() => void openDismissed()}
+          title="References you deleted, which sync will not offer again"
+        >
+          <span className="rail__name">Dismissed</span>
         </button>
 
         <div className="rail__heading">Boards</div>
@@ -635,7 +741,9 @@ export default function App() {
       <div className="main">
         <header className="bar">
           <div className="bar__identity">
-            <h1>{activeBoard ? activeBoard.name : "Burrow"}</h1>
+            <h1>
+              {showDismissed ? "Dismissed" : activeBoard ? activeBoard.name : "Burrow"}
+            </h1>
             <span className="bar__count">{heading}</span>
           </div>
 
@@ -886,15 +994,57 @@ export default function App() {
               <input type="date" value={syncTo} onChange={(e) => setSyncTo(e.target.value)} />
             </label>
 
+            {/* A preset menu answers the common case and the box answers the
+                rest. Either alone is what made a 1500-item bookmark list feel
+                permanently truncated. */}
             <label>
-              <span>Up to</span>
-              <select value={syncBatch} onChange={(e) => setSyncBatch(Number(e.target.value))}>
+              <span>How many</span>
+              <select
+                value={
+                  // 0 is the same request as picking "Everything", so the menu
+                  // has to say so — otherwise choosing Everything and typing 0
+                  // leave the control reading two different things.
+                  syncBatch === 0
+                    ? "all"
+                    : SYNC_BATCH_OPTIONS.includes(syncBatch as never)
+                      ? syncBatch
+                      : "custom"
+                }
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "all") setSyncBatch(0);
+                  else if (v !== "custom") setSyncBatch(Number(v));
+                }}
+              >
                 {SYNC_BATCH_OPTIONS.map((n) => (
                   <option key={n} value={n}>
                     {n} items
                   </option>
                 ))}
+                <option value="all">Everything</option>
+                <option value="custom">Custom…</option>
               </select>
+            </label>
+
+            <label>
+              <span>{syncBatch === 0 ? "All of them" : "Exactly"}</span>
+              <input
+                type="number"
+                min={0}
+                max={MAX_SYNC_BATCH}
+                step={1}
+                value={syncBatch}
+                aria-label="Number of items to sync, 0 for everything"
+                title="0 syncs everything it can reach"
+                onChange={(e) => {
+                  // Clamped here rather than only in Rust so the field cannot
+                  // display a number the sync will silently not honour.
+                  const n = Number(e.target.value);
+                  if (Number.isFinite(n)) {
+                    setSyncBatch(Math.max(0, Math.min(MAX_SYNC_BATCH, Math.floor(n))));
+                  }
+                }}
+              />
             </label>
 
             <button type="button" className="sync__go" onClick={() => void runSync()} disabled={syncing}>
@@ -938,6 +1088,9 @@ export default function App() {
               <>
                 <strong>{notice.deleted}</strong> deleted
                 {notice.bytesFreed ? <> · {formatBytes(notice.bytesFreed)} freed</> : null}
+                {notice.dismissed ? (
+                  <> · {notice.dismissed} will not be re-synced</>
+                ) : null}
               </>
             ) : notice.downloaded !== undefined ? (
               <>
@@ -957,7 +1110,21 @@ export default function App() {
                   <> ({notice.images} image{notice.images === 1 ? "" : "s"},{" "}
                   {notice.videos} video{notice.videos === 1 ? "" : "s"})</>
                 )}
+                {notice.dismissed ? (
+                  <> · {notice.dismissed} skipped (deleted before)</>
+                ) : null}
                 {notice.syncedFrom && <> · from {notice.syncedFrom}</>}
+                {/* The line that answers "why didn't it get everything?".
+                    Without it, a limit and an exhausted list look identical. */}
+                {notice.stoppedBecause && (
+                  <div className="banner__why">
+                    {notice.stoppedBecause}
+                    {notice.scanned && <> · {notice.scanned}</>}
+                    {notice.moreAvailable && (
+                      <> · <b>ask for a larger number to get more</b></>
+                    )}
+                  </div>
+                )}
               </>
             )}
             {notice.failed.length > 0 && <> · {notice.failed.length} failed</>}
@@ -983,7 +1150,60 @@ export default function App() {
 
         {(importingCount !== null || syncing) && <div className="progress" />}
 
-        {!loading && assets.length === 0 ? (
+        {showDismissed ? (
+          <section className="dismissed">
+            <p className="dismissed__lede">
+              These were deleted on purpose, so syncing from X will not offer
+              them again. Allowing one back does not restore it — it just lets
+              the next sync pick it up.
+            </p>
+            {dismissed.length === 0 ? (
+              <p className="empty__detail">
+                Nothing is being skipped. Deleting a reference that came from a
+                link or from X will add it here.
+              </p>
+            ) : (
+              <>
+                <div className="dismissed__bar">
+                  <span>
+                    {dismissed.length} skipped
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (
+                        window.confirm(
+                          `Allow all ${dismissed.length} back?\n\nThe next sync will offer them again.`,
+                        )
+                      )
+                        void allowAgain([]);
+                    }}
+                  >
+                    Allow all again
+                  </button>
+                </div>
+                <ul className="dismissed__list">
+                  {dismissed.map((d) => (
+                    <li className="dismissed__row" key={d.remoteUrl}>
+                      <span className="dismissed__text">
+                        <span className="dismissed__title">
+                          {d.title ?? d.pageUrl ?? "Untitled reference"}
+                        </span>
+                        <span className="dismissed__url">{d.remoteUrl}</span>
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => void allowAgain([d.remoteUrl])}
+                      >
+                        Allow again
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )}
+          </section>
+        ) : !loading && assets.length === 0 ? (
           <div className="empty">
             <p className="empty__headline">
               {activeBoard

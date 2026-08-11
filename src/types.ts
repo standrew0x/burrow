@@ -69,7 +69,17 @@ export interface FailedImport {
 export interface ImportReport {
   imported: Asset[];
   duplicates: number;
+  /** Skipped because they had been deleted from the library before. */
+  dismissed: number;
   failed: FailedImport[];
+}
+
+/** A reference deleted on purpose, kept out of future syncs. */
+export interface Dismissed {
+  remoteUrl: string;
+  pageUrl: string | null;
+  title: string | null;
+  dismissedAt: number;
 }
 
 export interface ColorMatch {
@@ -90,6 +100,8 @@ export interface Board {
 export interface DeleteReport {
   deleted: number;
   bytesFreed: number;
+  /** How many were remembered so a later sync will not offer them again. */
+  dismissed: number;
   /** Rows removed whose files could not be unlinked — wasted disk, not a broken tile. */
   orphanedFiles: string[];
 }
@@ -97,6 +109,7 @@ export interface DeleteReport {
 export type SyncKinds = "all" | "images" | "videos";
 
 export interface SyncOptions {
+  /** How many media items to take. 0 means "as many as there are". */
   limit?: number;
   /** Omit for every bookmark; set to sync one folder. */
   folder?: string;
@@ -120,8 +133,23 @@ export interface SyncReport {
   downloaded: number;
   imported: number;
   duplicates: number;
+  /** Skipped because they were deleted from the library before. */
+  dismissed: number;
   images: number;
   videos: number;
+  /**
+   * Why the walk ended, in a sentence.
+   *
+   * A count alone cannot distinguish "that is all your bookmarks hold" from
+   * "there is more, ask for more", and mistaking the second for the first is
+   * what makes a working sync feel like it is losing things.
+   */
+  stoppedBecause: string;
+  /** Whether a larger number would return more. */
+  moreAvailable: boolean;
+  pages: number;
+  /** Posts examined, including ones carrying no media. */
+  postsScanned: number;
   failed: FailedImport[];
 }
 

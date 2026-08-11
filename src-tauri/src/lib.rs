@@ -53,6 +53,8 @@ pub fn run() {
             commands::delete_assets,
             commands::set_note,
             commands::search_notes,
+            commands::list_dismissed,
+            commands::undismiss,
             commands::sync_from_x,
             commands::x_folders,
             commands::x_status,

@@ -1,0 +1,42 @@
+<!-- @dsCard group="Foundations" name="Type" subtitle="Fraunces display against Instrument Sans body" viewport="720x680" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Type</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 700px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.demo-head:first-child { margin-top: 0; }
+.spec { display: grid; grid-template-columns: 72px 1fr; gap: var(--space-3); align-items: baseline; margin-bottom: var(--space-3); }
+.spec code { font-family: var(--font-mono); font-size: 10px; color: color-mix(in srgb, var(--color-text) 50%, transparent); }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head">Display — Fraunces</h6>
+  <div class="spec"><code>44 / 1.15</code><h1 style="margin:0">Reference library</h1></div>
+  <div class="spec"><code>34 / 1.15</code><h2 style="margin:0">Bookmarks and boards</h2></div>
+  <div class="spec"><code>26 / 1.15</code><h3 style="margin:0">Colour search</h3></div>
+  <div class="spec"><code>20 / 1.15</code><h4 style="margin:0">Linked references</h4></div>
+
+  <h6 class="demo-head">Body — Instrument Sans</h6>
+  <p>A reference is something you looked at once and wanted back. The library stores a thumbnail, a palette, and wherever the original lives — so a shot you saw in a bookmark six months ago is still findable by the colour you remember rather than the words you did not write down.</p>
+  <p class="text-muted">Muted body, for secondary explanation. 15px on a 1.6 line — the line height is generous because this system separates with air rather than rules.</p>
+
+  <h6 class="demo-head">Caption — Fraunces italic</h6>
+  <figcaption>Two shades of the same blue, two years apart.</figcaption>
+
+  <h6 class="demo-head">Mono — data</h6>
+  <p class="text-mono">2026-08-05_Lovable_what-should-the-shopping-cart-look-like_2085043732903301438_0.mp4</p>
+
+  <hr class="hr" />
+  <p class="note">Two families doing two jobs. Fraunces carries anything a person wrote — headings, captions, and the notes attached to a reference — so authored text is visually distinct from generated text at a glance. Instrument Sans carries the interface: labels, buttons, counts.</p>
+  <p class="note">The rule that keeps it honest: <strong>if a machine produced the string, it is not set in the serif.</strong> Filenames, dimensions and hashes go to the mono face; everything the library computed goes to the sans.</p>
+</main>
+</body>
+</html>

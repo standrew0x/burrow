@@ -1,0 +1,64 @@
+<!-- @dsCard group="Components" name="Forms" subtitle="Inputs, segmented control, radios, counts" viewport="640x620" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — Forms</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 620px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.demo-head { margin: var(--space-6) 0 var(--space-3); }
+.demo-head:first-child { margin-top: 0; }
+.row { display: flex; align-items: center; gap: var(--space-3); flex-wrap: wrap; }
+.two { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-3); }
+.pair { display: flex; gap: var(--space-2); }
+.pair select { flex: 1; }
+.pair input { width: 96px; flex: none; }
+.note { font-size: 13px; max-width: 62ch; color: color-mix(in srgb, var(--color-text) 65%, transparent); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 class="demo-head">Text</h6>
+  <div class="field"><label for="a">Paste a link</label>
+    <input id="a" class="input" type="url" placeholder="https://x.com/…" /></div>
+
+  <h6 class="demo-head">Pairs</h6>
+  <div class="two">
+    <div class="field"><label for="b">Posted after</label><input id="b" class="input" type="date" /></div>
+    <div class="field"><label for="c">and before</label><input id="c" class="input" type="date" /></div>
+  </div>
+
+  <h6 class="demo-head">Preset plus free value</h6>
+  <div class="field"><label for="d">How many</label>
+    <div class="pair">
+      <select id="d" class="input"><option>25 items</option><option>100 items</option><option selected>Custom…</option><option>Everything</option></select>
+      <input class="input" type="number" value="250" aria-label="Custom count" />
+    </div>
+  </div>
+  <p class="note">A menu answers the common case and the field answers the rest. Either alone is what makes a large collection feel permanently truncated.</p>
+
+  <h6 class="demo-head">Segmented</h6>
+  <div class="seg">
+    <label class="seg-opt"><input type="radio" name="k" checked /> Everything</label>
+    <label class="seg-opt"><input type="radio" name="k" /> Images</label>
+    <label class="seg-opt"><input type="radio" name="k" /> Video</label>
+  </div>
+
+  <h6 class="demo-head">Radio</h6>
+  <div class="row">
+    <label class="radio"><input type="radio" name="f" checked /><span class="dot"></span> Thumbnails only</label>
+    <label class="radio"><input type="radio" name="f" /><span class="dot"></span> Full media</label>
+  </div>
+
+  <h6 class="demo-head">Note</h6>
+  <div class="field"><label for="e">What is this for?</label>
+    <textarea id="e" class="input" placeholder="Grade the water, not the sky."></textarea></div>
+
+  <hr class="hr" />
+  <p class="note">Labels are small, tracked and uppercase so they read as apparatus rather than prose — which leaves the serif free to mean "a person wrote this".</p>
+</main>
+</body>
+</html>

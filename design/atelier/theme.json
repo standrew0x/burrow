@@ -1,0 +1,33 @@
+{
+  "name": "Atelier",
+  "palette": {
+    "hue": 38,
+    "band": "light",
+    "scheme": "analogous",
+    "sat": 0.35,
+    "bg": "#f6f3ed",
+    "surface": "#fffdf9",
+    "text": "#1f1c17",
+    "accent": "#7a6a3f",
+    "accent2": "#a4552f"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Fraunces",
+      "class": "serif",
+      "weights": [400, 600, 700]
+    },
+    "body": {
+      "family": "Instrument Sans",
+      "class": "grotesque",
+      "weights": [400, 500, 600]
+    }
+  },
+  "density": 1.25,
+  "radius": 2,
+  "layoutStyle": "stack",
+  "dividers": "hairline",
+  "buttonAlign": "center",
+  "imageTreatment": "none",
+  "photo": "atelier"
+}
