@@ -1,0 +1,50 @@
+<!-- @dsCard group="In use" name="Burrow" subtitle="The system on a real 10-reference library" viewport="900x640" -->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Atelier — in use</title>
+<link rel="stylesheet" href="../styles.css" />
+<style>
+/* Demo scaffolding only — everything visual comes from ../styles.css. */
+.demo { max-width: 880px; margin: 0 auto; padding: var(--space-6) var(--space-4) var(--space-8); }
+.shot { border: 1px solid var(--color-divider); margin-bottom: var(--space-4); }
+.shot img { width: 100%; }
+.notes { display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-4); }
+.note { font-size: 13px; color: color-mix(in srgb, var(--color-text) 68%, transparent); }
+.note strong { color: var(--color-text); }
+</style>
+</head>
+<body>
+<main class="demo">
+  <h6 style="margin-top:0">In use</h6>
+  <h3>Burrow — reference library</h3>
+  <p class="text-muted" style="font-size:14px">
+    A Tauri app for keeping images and video pulled from bookmarks and pasted
+    links, searchable by the colours in them. The screenshot is the real window,
+    not a mockup.
+  </p>
+
+  <figure class="shot">
+    <img src="../assets/burrow-library.png" alt="Burrow's library view: a sidebar, a search bar, and a masonry grid of reference tiles" />
+  </figure>
+
+  <div class="notes">
+    <p class="note"><strong>Serif for what a person wrote.</strong> Tile names and
+      notes are Fraunces; dimensions and file sizes are mono. The two are stacked
+      directly on top of each other so the difference does the work no label
+      could.</p>
+    <p class="note"><strong>The palette is permanent.</strong> A 10px strip on the
+      bottom edge of every tile, opening to 22px with hex labels on hover. It is
+      what the library searches on, so it is not a hover detail.</p>
+    <p class="note"><strong>The active item is an inset edge</strong>, not a filled
+      block. A solid selection bar in a sidebar this pale would be the brightest
+      thing on screen, competing with the grid.</p>
+    <p class="note"><strong>No grayscale.</strong> Every strong colour in the
+      window belongs to the references. The chrome contributes paper, ink and one
+      olive edge, which is the entire point.</p>
+  </div>
+</main>
+</body>
+</html>
