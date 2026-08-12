@@ -651,6 +651,8 @@ export default function App() {
   return (
     <div className={`app${dragging ? " app--dragging" : ""}`}>
       <aside className="rail">
+        <div className="rail__brand">Burrow</div>
+
         <button
           type="button"
           className={`rail__item${
@@ -736,6 +738,16 @@ export default function App() {
             </div>
           </div>
         ))}
+
+        {/* Where the library actually lives. Worth a permanent line: it is the
+            folder to back up, and it is not somewhere anyone would guess. */}
+        {root && (
+          <div className="rail__foot">
+            <span className="rail__path" title={root}>
+              {root}
+            </span>
+          </div>
+        )}
       </aside>
 
       <div className="main">
@@ -1276,7 +1288,10 @@ export default function App() {
                         }
                         aria-label={`Download ${asset.originalName ?? "reference"}`}
                       >
-                        {downloading.has(asset.id) ? "…" : "↓"}
+                        {/* A corner flag rather than an icon: whether the bytes
+                            are here changes what pressing play will do, so it
+                            says so in words. */}
+                        {downloading.has(asset.id) ? "Saving…" : "Linked ↓"}
                       </button>
                     )}
                     {/* Above .tile__play, which covers the whole media box. */}

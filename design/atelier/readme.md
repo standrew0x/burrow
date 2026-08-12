@@ -56,11 +56,20 @@ and a muted olive.
 - `components/` — buttons, forms, navigation, dialog, and the app-specific
   reference tile.
 
-## Known constraint
+## Fonts and content-security policy
 
-`styles.css` pulls Fraunces and Instrument Sans from Google Fonts over
-`@import`. Any host with a strict `default-src 'self'` content-security policy —
-a Tauri or Electron shell, for instance — will refuse that request and fall back
-to Georgia and system-ui. To ship this inside such an app, vendor the two
-families as local `woff2` files and replace the `@import` with `@font-face`.
-Both are OFL-licensed, so redistributing them is permitted.
+`styles.css` here pulls Fraunces and Instrument Sans from Google Fonts over
+`@import`, which is fine for these preview pages. Any host with a strict
+`default-src 'self'` policy will refuse that request and fall back silently to
+Georgia and system-ui — the design still *renders*, which is what makes the
+failure easy to miss.
+
+Burrow, which is a Tauri shell and has exactly that policy, therefore vendors
+both families instead: `src/assets/fonts/*.woff2`, latin and latin-extended
+subsets, referenced from `@font-face` with relative URLs so they resolve as
+`'self'`. 168 KB for all four files. Both faces are OFL, so redistributing them
+is permitted.
+
+Do the same in any other app that adopts this system. Checking is one line in
+the console: if `document.fonts.check('16px Fraunces')` is false, the serif
+never arrived and the interface is quietly wearing Georgia.

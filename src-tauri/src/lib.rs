@@ -17,11 +17,13 @@ use store::Library;
 pub fn run() {
     let root = Library::default_root().expect("no local app data directory");
     let library = Library::open(&root).expect("could not open library");
+    let thumbs = root.join("thumbs");
+    let blobs = root.join("blobs");
     let state = AppState::new(library).expect("could not open database");
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .setup(|app| {
+        .setup(move |app| {
             // Prefer the ffmpeg shipped in the bundle so video import works on
             // a machine that has never heard of ffmpeg. Falls back to PATH,
             // which is what `tauri dev` and the CLI examples use.
@@ -31,6 +33,22 @@ pub fn run() {
                 .resolve("ffmpeg", tauri::path::BaseDirectory::Resource)
             {
                 crate::video::use_bundled_dir(dir);
+            }
+
+            // The static scope in tauri.conf.json covers $APPLOCALDATA, which is
+            // where the library normally lives. A library relocated with
+            // BURROW_LIBRARY falls outside it, and the failure is silent and
+            // total: every request is refused, so the whole grid renders as
+            // broken images with nothing in the console to explain it.
+            //
+            // Only these two directories are added, never the library root --
+            // the root also holds x_session.json, and the asset protocol is
+            // reachable from page scripts.
+            let scope = app.asset_protocol_scope();
+            for dir in [&thumbs, &blobs] {
+                if let Err(e) = scope.allow_directory(dir, true) {
+                    eprintln!("could not grant asset access to {}: {e}", dir.display());
+                }
             }
             Ok(())
         })
