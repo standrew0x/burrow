@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-label="Burrow">
+  <title>Burrow</title>
+  <desc>A dark squircle tile with three stacked amber plates rising from a warm glow.</desc>
+
+  <defs>
+    <!-- Squircle with real corner smoothing, not a large-radius rounded rect. -->
+    <clipPath id="sq">
+      <path d="M256 0c144 0 192 16 220 48 28 32 36 80 36 208s-8 176-36 208c-28 32-76 48-220 48S64 496 36 464C8 432 0 384 0 256S8 80 36 48C64 16 112 0 256 0Z"/>
+    </clipPath>
+
+    <linearGradient id="tile" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#332c3a"/>
+      <stop offset=".42" stop-color="#181520"/>
+      <stop offset="1" stop-color="#08070b"/>
+    </linearGradient>
+
+    <!-- The glow is load-bearing. Without it the tile is a black square on a
+         black taskbar and the whole icon disappears. -->
+    <radialGradient id="glow" cx=".5" cy="1.02" r=".78">
+      <stop offset="0" stop-color="#ffa53a" stop-opacity=".95"/>
+      <stop offset=".34" stop-color="#e0701c" stop-opacity=".45"/>
+      <stop offset=".72" stop-color="#8a3a10" stop-opacity=".13"/>
+      <stop offset="1" stop-color="#000" stop-opacity="0"/>
+    </radialGradient>
+
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff" stop-opacity=".17"/>
+      <stop offset=".7" stop-color="#fff" stop-opacity=".02"/>
+      <stop offset="1" stop-color="#fff" stop-opacity="0"/>
+    </linearGradient>
+
+    <!-- Plates brighten toward the viewer: the front one is nearly white, the
+         back two fall away into the tile. -->
+    <linearGradient id="pFront" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fff6e6"/>
+      <stop offset=".55" stop-color="#ffc069"/>
+      <stop offset="1" stop-color="#f08a22"/>
+    </linearGradient>
+    <linearGradient id="pMid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d99748"/>
+      <stop offset="1" stop-color="#a75f1d"/>
+    </linearGradient>
+    <linearGradient id="pBack" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8a6134"/>
+      <stop offset="1" stop-color="#5c3c18"/>
+    </linearGradient>
+
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="26"/>
+    </filter>
+  </defs>
+
+  <g clip-path="url(#sq)">
+    <rect width="512" height="512" fill="url(#tile)"/>
+    <rect width="512" height="512" fill="url(#glow)"/>
+    <rect width="512" height="300" fill="url(#gloss)"/>
+
+    <!-- Warm bloom behind the stack, so the plates sit in light rather than on it. -->
+    <ellipse cx="256" cy="410" rx="150" ry="62" fill="#ff9b2f" opacity=".5" filter="url(#soft)"/>
+
+    <g>
+      <rect x="152" y="96"  width="208" height="56"  rx="12" fill="url(#pBack)"/>
+      <rect x="116" y="180" width="280" height="64"  rx="13" fill="url(#pMid)"/>
+      <rect x="80"  y="272" width="352" height="144" rx="16" fill="url(#pFront)"/>
+      <!-- A single highlight along the front plate's top edge reads as a lit
+           surface; without it the stack looks printed on. -->
+      <rect x="80" y="272" width="352" height="10" rx="5" fill="#fff" opacity=".55"/>
+    </g>
+  </g>
+
+  <!-- Rim light. The second half of the dark-ground problem: it separates the
+       tile from whatever it sits on. -->
+  <path d="M256 0c144 0 192 16 220 48 28 32 36 80 36 208s-8 176-36 208c-28 32-76 48-220 48S64 496 36 464C8 432 0 384 0 256S8 80 36 48C64 16 112 0 256 0Z"
+        fill="none" stroke="#fff" stroke-opacity=".2" stroke-width="4"/>
+</svg>
