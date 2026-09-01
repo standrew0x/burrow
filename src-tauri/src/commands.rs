@@ -364,6 +364,8 @@ pub async fn sync_from_x(
                             crate::xsync::BookmarkKind::Image => crate::ingest::MediaKind::Image,
                         },
                         title: Some(describe_post(item)),
+                        posted_at: (!item.date.is_empty()).then(|| item.date.clone()),
+                        x_bookmark_sort_index: item.bookmark_sort_index.clone(),
                         thumbnail,
                     }),
                     Err(e) => failed.push(crate::ingest::FailedImport {
@@ -393,6 +395,8 @@ pub async fn sync_from_x(
                     path,
                     page_url: item.tweet_url.clone(),
                     media_url: item.media_url.clone(),
+                    posted_at: (!item.date.is_empty()).then(|| item.date.clone()),
+                    x_bookmark_sort_index: item.bookmark_sort_index.clone(),
                 }),
                 Err(e) => failed.push(crate::ingest::FailedImport {
                     path: item.tweet_url.clone(),
@@ -466,8 +470,12 @@ pub async fn sync_from_x(
             // second, linked copy of a file that is already on disk.
             {
                 let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-                let mut stmt = conn
-                    .prepare("UPDATE assets SET source_url = ?1, remote_url = ?2 WHERE id = ?3")?;
+                let mut stmt = conn.prepare(
+                    "UPDATE assets
+                         SET source_url = ?1, remote_url = ?2, posted_at = ?3,
+                             x_bookmark_sort_index = ?4
+                         WHERE id = ?5",
+                )?;
                 for asset in &report.imported {
                     let name = asset.original_name.clone().unwrap_or_default();
                     if let Some(d) = downloaded.iter().find(|d| {
@@ -476,7 +484,13 @@ pub async fn sync_from_x(
                             .map(|f| f.to_string_lossy() == name.as_str())
                             == Some(true)
                     }) {
-                        stmt.execute(rusqlite::params![d.page_url, d.media_url, asset.id])?;
+                        stmt.execute(rusqlite::params![
+                            d.page_url,
+                            d.media_url,
+                            d.posted_at,
+                            d.x_bookmark_sort_index,
+                            asset.id
+                        ])?;
                     }
                 }
             }
@@ -512,6 +526,8 @@ struct FromX {
     page_url: String,
     /// The media file, which is what dedup and tombstones key on.
     media_url: String,
+    posted_at: Option<String>,
+    x_bookmark_sort_index: Option<String>,
 }
 
 /// How far the bookmark walk got, carried through to the report.
@@ -575,43 +591,44 @@ pub async fn add_links(
     state: tauri::State<'_, AppState>,
     urls: Vec<String>,
 ) -> Result<ImportReport> {
-    let (links, failed) = tauri::async_runtime::spawn_blocking(
-        move || -> (Vec<crate::ingest::PendingLink>, Vec<crate::ingest::FailedImport>) {
-            let mut links = Vec::new();
-            let mut failed = Vec::new();
-            for url in urls {
-                let url = url.trim().to_string();
-                if url.is_empty() {
-                    continue;
-                }
-                match crate::link::resolve(&url) {
-                    Ok(r) => links.push(crate::ingest::PendingLink {
-                        page_url: r.page_url,
-                        media_url: r.media_url,
-                        kind: r.kind,
-                        title: r.title,
-                        thumbnail: r.thumbnail,
-                    }),
-                    Err(e) => failed.push(crate::ingest::FailedImport {
-                        path: url,
-                        reason: e.to_string(),
-                    }),
-                }
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || -> Result<ImportReport> {
+        let mut links = Vec::new();
+        let mut failed = Vec::new();
+        for url in urls {
+            let url = url.trim().to_string();
+            if url.is_empty() {
+                continue;
             }
-            (links, failed)
-        },
-    )
+            match crate::link::resolve(&url) {
+                Ok(r) => links.push(crate::ingest::PendingLink {
+                    page_url: r.page_url,
+                    media_url: r.media_url,
+                    kind: r.kind,
+                    title: r.title,
+                    posted_at: None,
+                    x_bookmark_sort_index: None,
+                    thumbnail: r.thumbnail,
+                }),
+                Err(e) => failed.push(crate::ingest::FailedImport {
+                    path: url,
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        // Thumbnail decode, WebP encoding, palette extraction, filesystem
+        // writes and SQLite work are all blocking. Keeping them inside this
+        // closure prevents a large artwork image from occupying Tauri's
+        // async command worker and making the rest of the app feel frozen.
+        let library = Library::open(library_root)?;
+        let mut conn = crate::db::open(&library.db_path())?;
+        let mut report = ingest::import_links(&library, &mut conn, links)?;
+        failed.append(&mut report.failed);
+        report.failed = failed;
+        Ok(report)
+    })
     .await
-    .map_err(|e| Error::Link(format!("link resolution panicked: {e}")))?;
-
-    let mut report = {
-        let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-        ingest::import_links(&state.library, &mut conn, links)?
-    };
-    let mut failed = failed;
-    failed.append(&mut report.failed);
-    report.failed = failed;
-    Ok(report)
+    .map_err(|e| Error::Link(format!("link import panicked: {e}")))?
 }
 
 /// Downloads the media behind linked references.

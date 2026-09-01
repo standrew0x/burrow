@@ -42,6 +42,10 @@ export interface Asset {
   remoteUrl: string | null;
   /** The user's own note. Null when unset — never an empty string. */
   note: string | null;
+  /** Source creation date (`YYYY-MM-DD`); for X this is the post date. */
+  postedAt: string | null;
+  /** Opaque X timeline position. Sortable as saved order, not an exact date. */
+  xBookmarkSortIndex: string | null;
   importedAt: number;
   swatches: Swatch[];
   /** Absolute path; run through convertFileSrc before use in an <img>. */

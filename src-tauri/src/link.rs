@@ -17,6 +17,8 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::time::Duration;
 
+use serde::Deserialize;
+
 use crate::error::{Error, Result};
 use crate::ingest::MediaKind;
 
@@ -50,6 +52,19 @@ pub struct Resolved {
     pub title: Option<String>,
     /// Still image bytes, in whatever format the source served.
     pub thumbnail: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MusicService {
+    YouTube,
+    Spotify,
+    AppleMusic,
+}
+
+#[derive(Debug, Deserialize)]
+struct OEmbed {
+    title: Option<String>,
+    thumbnail_url: Option<String>,
 }
 
 /// Rejects URLs that are not safely fetchable.
@@ -188,6 +203,28 @@ pub fn resolve(url: &str) -> Result<Resolved> {
     }
 
     let http = client()?;
+
+    // Music-service pages are references to something playable on the service,
+    // not downloadable media files. Resolve their title and cover art through
+    // the lightest public metadata surface, then keep the original page URL for
+    // the UI's "open in service" action.
+    match music_service(&parsed) {
+        Some(MusicService::YouTube) => {
+            return resolve_oembed(&http, &parsed, "https://www.youtube.com/oembed", "YouTube")
+                .or_else(|_| resolve_page(&http, &parsed));
+        }
+        Some(MusicService::Spotify) => {
+            return resolve_oembed(&http, &parsed, "https://open.spotify.com/oembed", "Spotify");
+        }
+        Some(MusicService::AppleMusic) => {
+            // Apple Music publishes complete OpenGraph metadata on the page.
+            // Skip the generic HEAD probe: it adds a round trip but provides no
+            // information useful for a page reference.
+            return resolve_page(&http, &parsed);
+        }
+        None => {}
+    }
+
     let head = describe(&http, parsed.as_str())?;
 
     match head.kind {
@@ -221,6 +258,61 @@ pub fn resolve(url: &str) -> Result<Resolved> {
         }
         None => resolve_page(&http, &parsed),
     }
+}
+
+fn music_service(url: &reqwest::Url) -> Option<MusicService> {
+    let host = url.host_str()?.trim_start_matches("www.");
+    match host {
+        "youtube.com" | "m.youtube.com" | "music.youtube.com" | "youtu.be" => {
+            Some(MusicService::YouTube)
+        }
+        "open.spotify.com" | "spotify.link" => Some(MusicService::Spotify),
+        "music.apple.com" => Some(MusicService::AppleMusic),
+        _ => None,
+    }
+}
+
+/// Reads the small, public oEmbed document supplied by a media service.
+fn resolve_oembed(
+    http: &reqwest::blocking::Client,
+    page: &reqwest::Url,
+    endpoint: &str,
+    service: &str,
+) -> Result<Resolved> {
+    let mut request = reqwest::Url::parse(endpoint)
+        .map_err(|e| Error::Link(format!("bad {service} metadata endpoint: {e}")))?;
+    request
+        .query_pairs_mut()
+        .append_pair("url", page.as_str())
+        .append_pair("format", "json");
+
+    let response = http
+        .get(request)
+        .send()
+        .map_err(|e| Error::Link(format!("could not read {service} metadata: {e}")))?;
+    if !response.status().is_success() {
+        return Err(Error::Link(format!(
+            "{service} could not describe this link (HTTP {})",
+            response.status().as_u16()
+        )));
+    }
+    let meta: OEmbed = response
+        .json()
+        .map_err(|e| Error::Link(format!("invalid {service} metadata: {e}")))?;
+    let image = meta
+        .thumbnail_url
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| Error::Link(format!("{service} returned no cover art for {page}")))?;
+    let image_url = check_fetchable(&image)?;
+    let thumbnail = get_capped(http, image_url.as_str(), MAX_IMAGE_BYTES)?;
+
+    Ok(Resolved {
+        page_url: page.to_string(),
+        media_url: image_url.to_string(),
+        kind: MediaKind::Image,
+        title: meta.title.filter(|v| !v.trim().is_empty()),
+        thumbnail,
+    })
 }
 
 /// What a URL serves, without downloading it.
@@ -639,6 +731,36 @@ mod tests {
         for (url, want) in cases {
             let got = x_status_id(&reqwest::Url::parse(url).unwrap());
             assert_eq!(got.as_deref(), want, "for {url}");
+        }
+    }
+
+    #[test]
+    fn music_services_are_recognised_without_accepting_lookalike_hosts() {
+        let cases = [
+            (
+                "https://www.youtube.com/watch?v=abc",
+                Some(MusicService::YouTube),
+            ),
+            (
+                "https://music.youtube.com/watch?v=abc",
+                Some(MusicService::YouTube),
+            ),
+            ("https://youtu.be/abc", Some(MusicService::YouTube)),
+            (
+                "https://open.spotify.com/track/abc",
+                Some(MusicService::Spotify),
+            ),
+            ("https://spotify.link/abc", Some(MusicService::Spotify)),
+            (
+                "https://music.apple.com/us/song/123",
+                Some(MusicService::AppleMusic),
+            ),
+            ("https://youtube.com.evil.example/watch?v=abc", None),
+            ("https://notspotify.com/track/abc", None),
+        ];
+        for (url, want) in cases {
+            let parsed = reqwest::Url::parse(url).unwrap();
+            assert_eq!(music_service(&parsed), want, "for {url}");
         }
     }
 

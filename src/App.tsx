@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
-import { openPath } from "@tauri-apps/plugin-opener";
+import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   addLinks,
@@ -86,6 +86,29 @@ function urlsIn(text: string): string[] {
     .filter((s) => URL_PATTERN.test(s));
 }
 
+function sourceLabel(value: string | null): string | null {
+  if (!value) return null;
+  try {
+    const host = new URL(value).hostname.replace(/^www\./, "");
+    if (["youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"].includes(host)) {
+      return "YouTube";
+    }
+    if (host === "open.spotify.com" || host === "spotify.link") return "Spotify";
+    if (host === "music.apple.com") return "Apple Music";
+    if (["x.com", "twitter.com", "mobile.x.com", "mobile.twitter.com"].includes(host)) {
+      return "X";
+    }
+    return "Source";
+  } catch {
+    return null;
+  }
+}
+
+function isMusicSource(value: string | null): boolean {
+  const label = sourceLabel(value);
+  return label === "YouTube" || label === "Spotify" || label === "Apple Music";
+}
+
 /** Batch sizes offered next to the Sync button.
  *
  *  These are presets, not the limit — the box beside them takes any number, and
@@ -101,6 +124,26 @@ const SYNC_BATCH_OPTIONS = [10, 25, 50, 100, 250, 500] as const;
 const DEFAULT_SYNC_BATCH = 25;
 /** Matches MAX_SYNC_LIMIT in commands.rs; keep the two in step. */
 const MAX_SYNC_BATCH = 5000;
+/** Load the full supported library so a client-side sort is not just sorting
+ *  the newest page and quietly omitting older saves. */
+const VIEW_LIMIT = MAX_SYNC_BATCH;
+
+/**
+ * Recording-only mode. It never reads or writes X credentials and is inert in
+ * normal builds. Local paths supplied by the demo launcher are still imported
+ * through Burrow's real ingestion pipeline so the resulting library is honest.
+ */
+const DEMO_MODE = import.meta.env.VITE_BURROW_DEMO === "1";
+const DEMO_X_PATHS = (import.meta.env.VITE_BURROW_DEMO_X_PATHS ?? "")
+  .split(/[|;]/)
+  .map((path: string) => path.trim())
+  .filter(Boolean);
+const DEMO_IMPORT_PATHS = (import.meta.env.VITE_BURROW_DEMO_IMPORT_PATHS ?? "")
+  // PowerShell treats semicolons naturally in environment values; accept both
+  // separators so the demo picker remains portable across launch methods.
+  .split(/[|;]/)
+  .map((path: string) => path.trim())
+  .filter(Boolean);
 
 /** OkLab search radius. See DEFAULT_COLOR_TOLERANCE in commands.rs for how
  *  this number was picked; keep the two in step. */
@@ -119,6 +162,48 @@ function formatDuration(ms: number): string {
   const s = total % 60;
   const pad = (n: number) => String(n).padStart(2, "0");
   return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+}
+
+type SortKey = "added" | "name" | "posted" | "xSaved" | "kind" | "size" | "duration";
+type SortDirection = "asc" | "desc";
+
+const NAME_COLLATOR = new Intl.Collator(undefined, {
+  numeric: true,
+  sensitivity: "base",
+});
+
+/** Compare decimal strings without losing precision in JavaScript numbers. */
+function compareDecimalStrings(a: string, b: string): number {
+  if (!/^\d+$/.test(a) || !/^\d+$/.test(b)) return NAME_COLLATOR.compare(a, b);
+  const left = a.replace(/^0+/, "") || "0";
+  const right = b.replace(/^0+/, "") || "0";
+  return left.length === right.length
+    ? left.localeCompare(right)
+    : left.length - right.length;
+}
+
+function defaultDirection(key: SortKey): SortDirection {
+  return key === "name" || key === "kind" ? "asc" : "desc";
+}
+
+function directionLabel(key: SortKey, direction: SortDirection): string {
+  if (key === "name" || key === "kind") return direction === "asc" ? "A–Z" : "Z–A";
+  if (key === "size") return direction === "asc" ? "Smallest first" : "Largest first";
+  if (key === "duration") return direction === "asc" ? "Shortest first" : "Longest first";
+  return direction === "asc" ? "Oldest first" : "Newest first";
+}
+
+function formatSourceDate(value: string): string {
+  // Noon avoids a UTC date parsing edge shifting the label back a day in
+  // negative-offset timezones.
+  const date = new Date(`${value}T12:00:00`);
+  return Number.isNaN(date.getTime())
+    ? value
+    : new Intl.DateTimeFormat(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+      }).format(date);
 }
 
 /** Readable ink over a swatch, chosen from OkLab lightness. */
@@ -170,11 +255,66 @@ export default function App() {
   const [dismissed, setDismissed] = useState<Dismissed[]>([]);
   /** Ids currently being fetched, so their tiles can show it. */
   const [downloading, setDownloading] = useState<Set<number>>(new Set());
+  const [sortKey, setSortKey] = useState<SortKey>("added");
+  const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
 
   const activeBoard = useMemo(
     () => boards.find((b) => b.id === activeBoardId) ?? null,
     [boards, activeBoardId],
   );
+
+  const sortedAssets = useMemo(() => {
+    const value = (asset: Asset): string | number | null => {
+      switch (sortKey) {
+        case "name":
+          return asset.originalName ?? asset.hash;
+        case "posted":
+          return asset.postedAt;
+        case "xSaved":
+          return asset.xBookmarkSortIndex;
+        case "kind":
+          return `${asset.kind} ${asset.state}`;
+        case "size":
+          return asset.bytes;
+        case "duration":
+          return asset.durationMs;
+        case "added":
+        default:
+          return asset.importedAt;
+      }
+    };
+
+    return [...assets].sort((left, right) => {
+      const a = value(left);
+      const b = value(right);
+      // Unknown source dates/order and image durations always go last. Flipping
+      // direction should not make rows with no value look newest or largest.
+      if (a === null && b !== null) return 1;
+      if (a !== null && b === null) return -1;
+      if (a === null && b === null) {
+        return NAME_COLLATOR.compare(
+          left.originalName ?? left.hash,
+          right.originalName ?? right.hash,
+        );
+      }
+
+      let compared: number;
+      if (sortKey === "xSaved") {
+        compared = compareDecimalStrings(String(a), String(b));
+      } else if (typeof a === "number" && typeof b === "number") {
+        compared = a - b;
+      } else {
+        compared = NAME_COLLATOR.compare(String(a), String(b));
+      }
+      if (compared === 0) {
+        compared = NAME_COLLATOR.compare(
+          left.originalName ?? left.hash,
+          right.originalName ?? right.hash,
+        );
+      }
+      return sortDirection === "asc" ? compared : -compared;
+    });
+  }, [assets, sortDirection, sortKey]);
 
   const refreshBoards = useCallback(async () => {
     try {
@@ -187,14 +327,14 @@ export default function App() {
   const refresh = useCallback(async () => {
     try {
       if (activeBoardId !== null) {
-        setAssets(await listBoardAssets(activeBoardId, 500, 0));
+        setAssets(await listBoardAssets(activeBoardId, VIEW_LIMIT, 0));
       } else if (noteFilter) {
-        setAssets(await searchNotes(noteFilter, 500));
+        setAssets(await searchNotes(noteFilter, VIEW_LIMIT));
       } else if (colorFilter) {
-        const matches = await searchByColor(colorFilter, COLOR_TOLERANCE, 500);
+        const matches = await searchByColor(colorFilter, COLOR_TOLERANCE, VIEW_LIMIT);
         setAssets(matches.map((m) => m.asset));
       } else {
-        setAssets(await listAssets(500, 0));
+        setAssets(await listAssets(VIEW_LIMIT, 0));
       }
       setError(null);
     } catch (e) {
@@ -213,6 +353,14 @@ export default function App() {
     libraryRoot()
       .then(setRoot)
       .catch(() => {});
+    if (DEMO_MODE) {
+      setXState({
+        connected: false,
+        hasSession: false,
+        detail: "Demo account ready to connect",
+      });
+      return;
+    }
     // One authenticated call at startup so the Sync button can say whether it
     // will actually work before the user presses it.
     setXChecking(true);
@@ -226,6 +374,16 @@ export default function App() {
     setXChecking(true);
     setError(null);
     try {
+      if (DEMO_MODE) {
+        await new Promise((resolve) => window.setTimeout(resolve, 900));
+        setXState({
+          connected: true,
+          hasSession: true,
+          detail: "@a16z-demo · mock connection",
+        });
+        setConnectOpen(false);
+        return;
+      }
       const status = await saveXSession(authTokenInput, ct0Input);
       setXState(status);
       if (status.connected) {
@@ -244,6 +402,15 @@ export default function App() {
 
   const disconnectX = async () => {
     try {
+      if (DEMO_MODE) {
+        setXState({
+          connected: false,
+          hasSession: false,
+          detail: "Demo account ready to connect",
+        });
+        setFolders([]);
+        return;
+      }
       setXState(await clearXSession());
       setFolders([]);
     } catch (e) {
@@ -482,6 +649,27 @@ export default function App() {
     setNotice(null);
     setError(null);
     try {
+      if (DEMO_MODE) {
+        await new Promise((resolve) => window.setTimeout(resolve, 1200));
+        const report = await importPaths(DEMO_X_PATHS);
+        setActiveBoardId(null);
+        setColorFilter(null);
+        setNotice({
+          imported: report.imported.length,
+          duplicates: report.duplicates,
+          failed: report.failed,
+          syncedFrom: `${syncFolder || "All bookmarks"} · ${DEMO_X_PATHS.length} found`,
+          images: report.imported.length,
+          videos: 0,
+          stoppedBecause: "Reached the end of this demo bookmark folder.",
+          moreAvailable: false,
+          scanned: `${DEMO_X_PATHS.length} posts over 1 page`,
+        });
+        setSyncOpen(false);
+        await refresh();
+        await refreshBoards();
+        return;
+      }
       const report = await syncFromX({
         limit: syncBatch,
         folder: syncFolder || undefined,
@@ -760,6 +948,47 @@ export default function App() {
           </div>
 
           <div className="bar__actions">
+            {!showDismissed && (
+              <div
+                className="bar__sort"
+                title={
+                  sortKey === "xSaved"
+                    ? "X provides saved order, but not the exact date or time you bookmarked a post."
+                    : "Sort the references in this view"
+                }
+              >
+                <label>
+                  <span>Sort</span>
+                  <select
+                    value={sortKey}
+                    onChange={(event) => {
+                      const next = event.target.value as SortKey;
+                      setSortKey(next);
+                      setSortDirection(defaultDirection(next));
+                    }}
+                    aria-label="Sort references by"
+                  >
+                    <option value="added">Date added to Burrow</option>
+                    <option value="name">Name</option>
+                    <option value="posted">Date posted on X</option>
+                    <option value="xSaved">Saved on X (order)</option>
+                    <option value="kind">Type</option>
+                    <option value="size">File size</option>
+                    <option value="duration">Video duration</option>
+                  </select>
+                </label>
+                <button
+                  type="button"
+                  onClick={() =>
+                    setSortDirection((value) => (value === "asc" ? "desc" : "asc"))
+                  }
+                  aria-label={`Reverse sort: currently ${directionLabel(sortKey, sortDirection)}`}
+                  title="Reverse sort order"
+                >
+                  {directionLabel(sortKey, sortDirection)} {sortDirection === "asc" ? "↑" : "↓"}
+                </button>
+              </div>
+            )}
             <span
               className={`bar__xdot${xState?.connected ? " bar__xdot--on" : ""}`}
               title={
@@ -793,7 +1022,14 @@ export default function App() {
                 if (next && folders.length === 0 && !foldersLoading) {
                   setFoldersLoading(true);
                   setFoldersError(null);
-                  xFolders()
+                  (DEMO_MODE
+                    ? new Promise<string[]>((resolve) =>
+                        window.setTimeout(
+                          () => resolve(["a16z", "Design references", "Future of media"]),
+                          650,
+                        ),
+                      )
+                    : xFolders())
                     .then(setFolders)
                     .catch((e) => setFoldersError(String(e)))
                     .finally(() => setFoldersLoading(false));
@@ -801,7 +1037,9 @@ export default function App() {
               }}
               aria-expanded={syncOpen}
             >
-              {syncing ? `Syncing ${syncBatch}…` : "Sync from X"}
+              {syncing
+                ? `Syncing ${syncBatch}…`
+                : `Sync from X · ${syncDownload ? "full media" : "thumbnails"}`}
             </button>
           </div>
 
@@ -890,7 +1128,7 @@ export default function App() {
         {connectOpen && (
           <div className="connect">
             <div className="connect__head">
-              <strong>Connect your X account</strong>
+              <strong>{DEMO_MODE ? "Connect X · demo" : "Connect your X account"}</strong>
               <span
                 className={xState?.connected ? "connect__ok" : "connect__bad"}
               >
@@ -902,60 +1140,88 @@ export default function App() {
               </span>
             </div>
 
-            <ol className="connect__steps">
-              <li>Open <code>x.com</code> in your browser, signed in.</li>
-              <li>Press <kbd>F12</kbd>, then open the <b>Application</b> tab.</li>
-              <li>In the sidebar choose <b>Cookies &rarr; https://x.com</b>.</li>
-              <li>
-                Find <code>auth_token</code> and <code>ct0</code> and copy each
-                value into the boxes below.
-              </li>
-            </ol>
+            {DEMO_MODE ? (
+              <>
+                <ol className="connect__steps">
+                  <li>Choose the demo account prepared for this recording.</li>
+                  <li>Burrow will show the same connection and sync flow without contacting X.</li>
+                </ol>
+                <div className="connect__fields">
+                  <label>
+                    <span>Demo account</span>
+                    <input value="@a16z-demo" readOnly aria-label="Demo X account" />
+                  </label>
+                  <button
+                    type="button"
+                    className="sync__go"
+                    onClick={() => void connectX()}
+                    disabled={xChecking}
+                  >
+                    {xChecking ? "Connecting…" : "Connect demo account"}
+                  </button>
+                </div>
+                <p className="connect__note">
+                  Demo mode is local-only. No X credentials are used and no request is sent.
+                </p>
+              </>
+            ) : (
+              <>
+                <ol className="connect__steps">
+                  <li>Open <code>x.com</code> in your browser, signed in.</li>
+                  <li>Press <kbd>F12</kbd>, then open the <b>Application</b> tab.</li>
+                  <li>In the sidebar choose <b>Cookies &rarr; https://x.com</b>.</li>
+                  <li>
+                    Find <code>auth_token</code> and <code>ct0</code> and copy each
+                    value into the boxes below.
+                  </li>
+                </ol>
 
-            <div className="connect__fields">
-              <label>
-                <span>auth_token</span>
-                <input
-                  type="password"
-                  value={authTokenInput}
-                  onChange={(e) => setAuthTokenInput(e.target.value)}
-                  placeholder="40 characters"
-                  spellCheck={false}
-                  autoComplete="off"
-                />
-              </label>
-              <label>
-                <span>ct0</span>
-                <input
-                  type="password"
-                  value={ct0Input}
-                  onChange={(e) => setCt0Input(e.target.value)}
-                  placeholder="160 characters"
-                  spellCheck={false}
-                  autoComplete="off"
-                />
-              </label>
-              <button
-                type="button"
-                className="sync__go"
-                onClick={() => void connectX()}
-                disabled={xChecking || !authTokenInput.trim() || !ct0Input.trim()}
-              >
-                {xChecking ? "Checking…" : "Connect"}
-              </button>
-              {xState?.hasSession && (
-                <button type="button" onClick={() => void disconnectX()}>
-                  Disconnect
-                </button>
-              )}
-            </div>
+                <div className="connect__fields">
+                  <label>
+                    <span>auth_token</span>
+                    <input
+                      type="password"
+                      value={authTokenInput}
+                      onChange={(e) => setAuthTokenInput(e.target.value)}
+                      placeholder="40 characters"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <label>
+                    <span>ct0</span>
+                    <input
+                      type="password"
+                      value={ct0Input}
+                      onChange={(e) => setCt0Input(e.target.value)}
+                      placeholder="160 characters"
+                      spellCheck={false}
+                      autoComplete="off"
+                    />
+                  </label>
+                  <button
+                    type="button"
+                    className="sync__go"
+                    onClick={() => void connectX()}
+                    disabled={xChecking || !authTokenInput.trim() || !ct0Input.trim()}
+                  >
+                    {xChecking ? "Checking…" : "Connect"}
+                  </button>
+                  {xState?.hasSession && (
+                    <button type="button" onClick={() => void disconnectX()}>
+                      Disconnect
+                    </button>
+                  )}
+                </div>
 
-            <p className="connect__note">
-              These are stored only on this PC, in your library folder, and are
-              sent nowhere except x.com. They are as powerful as your password,
-              so do not share them. X expires them every few weeks &mdash; when
-              Sync starts failing, paste fresh ones here.
-            </p>
+                <p className="connect__note">
+                  These are stored only on this PC, in your library folder, and are
+                  sent nowhere except x.com. They are as powerful as your password,
+                  so do not share them. X expires them every few weeks &mdash; when
+                  Sync starts failing, paste fresh ones here.
+                </p>
+              </>
+            )}
           </div>
         )}
 
@@ -1233,16 +1499,35 @@ export default function App() {
                   ? "Notes match on any part of a word, so try a shorter fragment."
                   : colorFilter
                     ? "Try a different hue — the tolerance is deliberately tight."
-                    : "Drag files or folders from Explorer, or press Ctrl+V with a link copied. Linked references store only a thumbnail until you download them."}
+                    : "Drag files or folders from Explorer, or paste a YouTube, Spotify, Apple Music, or media link. Linked references store a thumbnail and open back to their source."}
             </p>
+            {DEMO_MODE && !activeBoard && !noteFilter && !colorFilter && (
+              <label className="empty__picker">
+                Choose demo files…
+                <input
+                  type="file"
+                  multiple
+                  accept="image/*,video/*"
+                  onChange={(event) => {
+                    if (event.currentTarget.files?.length) {
+                      void runImport(DEMO_IMPORT_PATHS);
+                    }
+                    event.currentTarget.value = "";
+                  }}
+                />
+              </label>
+            )}
             {root && !colorFilter && !activeBoard && (
               <code className="empty__path">{root}</code>
             )}
           </div>
         ) : (
           <main className="grid">
-            {assets.map((asset) => {
+            {sortedAssets.map((asset) => {
               const isSelected = selected.has(asset.id);
+              const sourceUrl = asset.sourceUrl;
+              const source = sourceLabel(sourceUrl);
+              const isMusic = isMusicSource(sourceUrl);
               return (
                 <figure
                   className={`tile${isSelected ? " tile--selected" : ""}`}
@@ -1284,14 +1569,20 @@ export default function App() {
                         title={
                           downloading.has(asset.id)
                             ? "Downloading…"
-                            : "Linked — streams from its source. Click to save a copy."
+                            : isMusic
+                              ? "Save this reference's cover artwork to the library."
+                              : "Linked — streams from its source. Click to save a copy."
                         }
-                        aria-label={`Download ${asset.originalName ?? "reference"}`}
+                        aria-label={`${isMusic ? "Save artwork for" : "Download"} ${asset.originalName ?? "reference"}`}
                       >
                         {/* A corner flag rather than an icon: whether the bytes
                             are here changes what pressing play will do, so it
                             says so in words. */}
-                        {downloading.has(asset.id) ? "Saving…" : "Linked ↓"}
+                        {downloading.has(asset.id)
+                          ? "Saving…"
+                          : isMusic
+                            ? "Artwork ↓"
+                            : "Linked ↓"}
                       </button>
                     )}
                     {/* Above .tile__play, which covers the whole media box. */}
@@ -1317,9 +1608,21 @@ export default function App() {
                     </button>
                   </div>
                   <figcaption className="tile__meta">
-                    <span className="tile__name">
-                      {asset.originalName ?? asset.hash.slice(0, 12)}
-                    </span>
+                    <div className="tile__nameRow">
+                      <span className="tile__name">
+                        {asset.originalName ?? asset.hash.slice(0, 12)}
+                      </span>
+                      {source && sourceUrl && (
+                        <button
+                          type="button"
+                          className="tile__source"
+                          onClick={() => void openUrl(sourceUrl)}
+                          title={`Open in ${source}`}
+                        >
+                          {source} ↗
+                        </button>
+                      )}
+                    </div>
                     <span className="tile__dims">
                       {asset.width}×{asset.height} ·{" "}
                       {asset.state === "linked" ? (
@@ -1330,6 +1633,11 @@ export default function App() {
                         formatBytes(asset.bytes)
                       )}
                     </span>
+                    {asset.postedAt && (
+                      <span className="tile__date">
+                        Posted {formatSourceDate(asset.postedAt)}
+                      </span>
+                    )}
                   </figcaption>
                   {editingNote === asset.id ? (
                     <div className="note note--editing">

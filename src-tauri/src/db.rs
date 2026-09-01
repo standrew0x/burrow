@@ -152,6 +152,16 @@ const MIGRATIONS: &[&str] = &[
         dismissed_at INTEGER NOT NULL
     );
     "#,
+    // --- v7: source dates and X bookmark order ---
+    //
+    // X exposes the post's creation date and a sortable timeline position, but
+    // not an honest bookmark timestamp. Keep those as separate facts rather
+    // than presenting the sync time as the time somebody saved the post.
+    r#"
+    ALTER TABLE assets ADD COLUMN posted_at TEXT;
+    ALTER TABLE assets ADD COLUMN x_bookmark_sort_index TEXT;
+    CREATE INDEX assets_posted_at ON assets(posted_at DESC);
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.

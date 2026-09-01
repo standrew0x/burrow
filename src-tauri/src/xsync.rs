@@ -263,21 +263,21 @@ impl XClient {
         // Shared chunks first: they carry several operations at once, so the
         // common case resolves everything in one fetch.
         candidates.sort_by_key(|(_, n)| !n.contains("shared"));
+        // X occasionally renames an operation chunk to a generic bundle name.
+        // Keep the targeted pass cheap, then fall back to the remaining JS
+        // chunks instead of reporting a false discovery failure.
+        let targeted_ids: std::collections::HashSet<String> =
+            candidates.iter().map(|(cid, _)| cid.clone()).collect();
+        for pair in &names {
+            if !targeted_ids.contains(&pair.0) {
+                candidates.push(pair);
+            }
+        }
 
         // Compiled once, not per chunk per operation: regex construction is far
         // more expensive than the match itself.
-        let switch_re = regex::Regex::new(r#""([^"]+)""#).unwrap();
-        let op_res: Vec<(&str, regex::Regex)> = operations
-            .iter()
-            .map(|op| {
-                let pattern = format!(
-                    r#"queryId:"([^"]+)",operationName:"{}"[^}}]*?featureSwitches:\[([^\]]*)\]"#,
-                    regex::escape(op)
-                );
-                (*op, regex::Regex::new(&pattern).unwrap())
-            })
-            .collect();
-
+        let switch_re = regex::Regex::new(r#"featureSwitches:\[([^\]]*)\]"#).unwrap();
+        let switch_value_re = regex::Regex::new(r#""([^"]+)""#).unwrap();
         let mut found: Vec<QuerySpec> = Vec::new();
         let mut found_names: Vec<String> = Vec::new();
 
@@ -297,19 +297,14 @@ impl XClient {
             }
             let Ok(chunk) = resp.text() else { continue };
 
-            for (op, re) in &op_res {
+            for op in operations {
                 if found_names.iter().any(|f| f == op) {
                     continue;
                 }
-                if let Some(c) = re.captures(&chunk) {
-                    let switches = switch_re
-                        .captures_iter(&c[2])
-                        .map(|s| s[1].to_string())
-                        .collect();
-                    found.push(QuerySpec {
-                        query_id: c[1].to_string(),
-                        feature_switches: switches,
-                    });
+                if let Some(spec) =
+                    Self::query_spec_in_chunk(&chunk, op, &switch_re, &switch_value_re)
+                {
+                    found.push(spec);
                     found_names.push((*op).to_string());
                 }
             }
@@ -332,6 +327,67 @@ impl XClient {
             })
             .collect();
         Ok(ordered)
+    }
+
+    /// Extracts one operation descriptor from a minified client chunk.
+    ///
+    /// X has changed the descriptor shape several times: feature switches have
+    /// moved under nested metadata objects and are occasionally omitted entirely.
+    /// The query id and operation name are the stable pair; switches are optional
+    /// and default to an empty feature object when absent.
+    fn query_spec_in_chunk(
+        chunk: &str,
+        operation: &str,
+        switch_re: &regex::Regex,
+        switch_value_re: &regex::Regex,
+    ) -> Option<QuerySpec> {
+        const DESCRIPTOR_SCAN_BYTES: usize = 4_000;
+        let operation_re =
+            regex::Regex::new(&format!(r#"operationName:"{}""#, regex::escape(operation))).ok()?;
+        let operation_match = operation_re.find(chunk)?;
+
+        // A bundle chunk contains many adjacent operation descriptors. Looking
+        // forward from the first queryId in a wide window can pair Bookmarks
+        // with an unrelated operation several modules earlier. Start at the
+        // operation name and take the nearest preceding queryId instead.
+        let mut start = operation_match
+            .start()
+            .saturating_sub(DESCRIPTOR_SCAN_BYTES);
+        while start < operation_match.start() && !chunk.is_char_boundary(start) {
+            start += 1;
+        }
+        let query_re = regex::Regex::new(r#"queryId:"([^"]+)""#).ok()?;
+        let query = query_re
+            .captures_iter(&chunk[start..operation_match.start()])
+            .last()?;
+        let query_match = query.get(0)?;
+        let descriptor_start = start + query_match.start();
+
+        // Stop before the next operation descriptor so a switch-less operation
+        // cannot accidentally inherit the following operation's switches.
+        let after_operation = operation_match.end();
+        let next_query = query_re
+            .find(&chunk[after_operation..])
+            .map(|m| after_operation + m.start());
+        let mut end = next_query
+            .unwrap_or_else(|| (after_operation + DESCRIPTOR_SCAN_BYTES).min(chunk.len()));
+        while end > after_operation && !chunk.is_char_boundary(end) {
+            end -= 1;
+        }
+        let descriptor = &chunk[descriptor_start..end];
+        let feature_switches = switch_re
+            .captures(descriptor)
+            .map(|c| {
+                switch_value_re
+                    .captures_iter(&c[1])
+                    .map(|s| s[1].to_string())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        Some(QuerySpec {
+            query_id: query[1].to_string(),
+            feature_switches,
+        })
     }
 
     fn graphql(
@@ -931,6 +987,9 @@ pub struct BookmarkMedia {
     pub ext: &'static str,
     /// `YYYY-MM-DD` the post was created, for date filtering.
     pub date: String,
+    /// Opaque position supplied by X's bookmark timeline. It orders saves, but
+    /// is not documented as (and must not be displayed as) an exact timestamp.
+    pub bookmark_sort_index: Option<String>,
     /// Position within the post; a tweet can carry up to four photos.
     pub index: usize,
 }
@@ -1211,7 +1270,18 @@ fn extract_tweets_and_cursor(data: &Value) -> (Vec<Value>, Option<String>) {
 
             if etype.contains("TimelineItem") {
                 if let Some(result) = content.pointer("/itemContent/tweet_results/result") {
-                    tweets.push(result.clone());
+                    let mut result = result.clone();
+                    let sort_index = entry
+                        .get("sortIndex")
+                        .or_else(|| content.get("sortIndex"))
+                        .and_then(|v| v.as_str());
+                    if let (Some(object), Some(sort_index)) = (result.as_object_mut(), sort_index) {
+                        object.insert(
+                            "_burrow_bookmark_sort_index".to_string(),
+                            Value::String(sort_index.to_string()),
+                        );
+                    }
+                    tweets.push(result);
                 }
             } else if etype.contains("Cursor")
                 && content.get("cursorType").and_then(|v| v.as_str()) == Some("Bottom")
@@ -1231,6 +1301,10 @@ fn extract_tweets_and_cursor(data: &Value) -> (Vec<Value>, Option<String>) {
 /// Returns a list rather than one item: a post can carry up to four photos, and
 /// taking only the first would quietly drop three references.
 fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
+    let bookmark_sort_index = result
+        .get("_burrow_bookmark_sort_index")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
     // Quoted/retweeted posts nest the real tweet one level down.
     let tweet = result.get("tweet").unwrap_or(result);
     let Some(legacy) = tweet.get("legacy") else {
@@ -1314,6 +1388,7 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
                 },
                 ext,
                 date: date.clone(),
+                bookmark_sort_index: bookmark_sort_index.clone(),
                 index,
             });
         }
@@ -1368,6 +1443,7 @@ mod tests {
             poster_url: None,
             ext: "mp4",
             date: "2026-01-01".into(),
+            bookmark_sort_index: None,
             index: 0,
         }
     }
@@ -1685,6 +1761,40 @@ mod tests {
     }
 
     #[test]
+    fn query_descriptor_discovery_tolerates_x_shape_changes() {
+        let switch_re = regex::Regex::new(r#"featureSwitches:\[([^\]]*)\]"#).unwrap();
+        let switch_value_re = regex::Regex::new(r#""([^"]+)""#).unwrap();
+
+        let old = r#"({queryId:"old-id",operationName:"Bookmarks",featureSwitches:["one","two"]})"#;
+        let old_spec = XClient::query_spec_in_chunk(old, "Bookmarks", &switch_re, &switch_value_re)
+            .expect("old descriptor shape should parse");
+        assert_eq!(old_spec.query_id, "old-id");
+        assert_eq!(old_spec.feature_switches, ["one", "two"]);
+
+        let nested = r#"({queryId:"new-id",operationType:"query",metadata:{featureSwitches:["one"]},operationName:"Bookmarks"})"#;
+        let nested_spec =
+            XClient::query_spec_in_chunk(nested, "Bookmarks", &switch_re, &switch_value_re)
+                .expect("nested descriptor shape should parse");
+        assert_eq!(nested_spec.query_id, "new-id");
+        assert_eq!(nested_spec.feature_switches, ["one"]);
+
+        let no_switches =
+            r#"({queryId:"minimal-id",operationName:"Bookmarks",operationType:"query"})"#;
+        let minimal =
+            XClient::query_spec_in_chunk(no_switches, "Bookmarks", &switch_re, &switch_value_re)
+                .expect("feature switches should be optional");
+        assert_eq!(minimal.query_id, "minimal-id");
+        assert!(minimal.feature_switches.is_empty());
+
+        let adjacent = r#"({queryId:"wrong-id",operationName:"BirdwatchThing",metadata:{featureSwitches:[]}}),({queryId:"right-id",operationName:"Bookmarks",metadata:{featureSwitches:["needed"]}}),({queryId:"later-id",operationName:"LaterThing",metadata:{featureSwitches:["wrong"]}})"#;
+        let adjacent_spec =
+            XClient::query_spec_in_chunk(adjacent, "Bookmarks", &switch_re, &switch_value_re)
+                .expect("the nearest query id should belong to Bookmarks");
+        assert_eq!(adjacent_spec.query_id, "right-id");
+        assert_eq!(adjacent_spec.feature_switches, ["needed"]);
+    }
+
+    #[test]
     fn brace_blocks_handles_nesting() {
         let blocks = balanced_brace_blocks(r#"{a:{b:1},c:2} then {d:3}"#, 2);
         assert_eq!(blocks[0], "{a:{b:1},c:2}");
@@ -1873,7 +1983,7 @@ mod tests {
     fn timeline_extraction_finds_tweets_and_the_bottom_cursor() {
         let data = serde_json::json!({ "bookmark_collection_timeline": { "timeline": {
             "instructions": [{ "entries": [
-                { "content": { "__typename": "TimelineTimelineItem",
+                { "sortIndex": "10000000000000000001", "content": { "__typename": "TimelineTimelineItem",
                     "itemContent": { "tweet_results": { "result": { "legacy": { "id_str": "1" } } } } } },
                 { "content": { "__typename": "TimelineTimelineItem",
                     "itemContent": { "tweet_results": { "result": { "legacy": { "id_str": "2" } } } } } },
@@ -1885,6 +1995,12 @@ mod tests {
         }}});
         let (tweets, cursor) = extract_tweets_and_cursor(&data);
         assert_eq!(tweets.len(), 2);
+        assert_eq!(
+            tweets[0]
+                .get("_burrow_bookmark_sort_index")
+                .and_then(Value::as_str),
+            Some("10000000000000000001")
+        );
         assert_eq!(
             cursor.as_deref(),
             Some("next-page"),

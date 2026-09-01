@@ -109,6 +109,11 @@ pub struct AssetRow {
     pub remote_url: Option<String>,
     /// The user's own note. `None` when unset; never an empty string.
     pub note: Option<String>,
+    /// `YYYY-MM-DD` supplied by the source. X uses the post creation date.
+    pub posted_at: Option<String>,
+    /// X's opaque bookmark-timeline position. It preserves saved order but is
+    /// deliberately not called a timestamp because X does not expose one.
+    pub x_bookmark_sort_index: Option<String>,
     pub imported_at: i64,
     pub swatches: Vec<Swatch>,
     /// Absolute path to the thumbnail, included on every row so the grid does
@@ -368,6 +373,8 @@ pub fn import_paths(
             source_url: None,
             remote_url: None,
             note: None,
+            posted_at: None,
+            x_bookmark_sort_index: None,
             imported_at,
             swatches: p.swatches.clone(),
             thumb_path: lib.thumb_path(&p.hash).display().to_string(),
@@ -495,6 +502,10 @@ pub struct PendingLink {
     pub media_url: String,
     pub kind: MediaKind,
     pub title: Option<String>,
+    /// Source creation date, when the resolver knows it (`YYYY-MM-DD`).
+    pub posted_at: Option<String>,
+    /// Opaque X bookmark timeline position; higher values are newer saves.
+    pub x_bookmark_sort_index: Option<String>,
     /// Encoded still image, in whatever format the source served.
     pub thumbnail: Vec<u8>,
 }
@@ -564,12 +575,17 @@ pub fn import_links(
     let mut seen: HashSet<String> = HashSet::new();
     {
         let mut exists = conn.prepare("SELECT 1 FROM assets WHERE remote_url = ?1")?;
-        let mut was_dismissed = conn.prepare("SELECT 1 FROM dismissed WHERE remote_url = ?1")?;
+        // Current rows are keyed by the media URL. Older X-synced rows,
+        // created before `remote_url` was introduced, only have their post
+        // URL in `source_url`; check both identities so a legacy tombstone is
+        // respected too.
+        let mut was_dismissed =
+            conn.prepare("SELECT 1 FROM dismissed WHERE remote_url = ?1 OR remote_url = ?2")?;
         for link in links {
             // Thrown away on purpose once already. Counted rather than silently
             // dropped: a skip nobody can see is the same as a sync that lost
             // things, which is exactly the complaint this feature answers.
-            if was_dismissed.exists(rusqlite::params![&link.media_url])? {
+            if was_dismissed.exists(rusqlite::params![&link.media_url, &link.page_url])? {
                 report.dismissed += 1;
                 continue;
             }
@@ -577,6 +593,21 @@ pub fn import_links(
             let already = !seen.insert(link.media_url.clone())
                 || exists.exists(rusqlite::params![&link.media_url])?;
             if already {
+                // A later X sync can enrich a link created by an older build,
+                // and refresh the saved-order position as the timeline moves.
+                if link.posted_at.is_some() || link.x_bookmark_sort_index.is_some() {
+                    conn.execute(
+                        "UPDATE assets
+                         SET posted_at = COALESCE(?1, posted_at),
+                             x_bookmark_sort_index = COALESCE(?2, x_bookmark_sort_index)
+                         WHERE remote_url = ?3",
+                        rusqlite::params![
+                            &link.posted_at,
+                            &link.x_bookmark_sort_index,
+                            &link.media_url
+                        ],
+                    )?;
+                }
                 report.duplicates += 1;
                 continue;
             }
@@ -610,8 +641,9 @@ pub fn import_links(
         tx.execute(
             "INSERT INTO assets
                 (hash, kind, duration_ms, ext, mime, width, height, bytes,
-                 original_name, source_url, imported_at, state, remote_url)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11)",
+                 original_name, source_url, imported_at, state, remote_url,
+                 posted_at, x_bookmark_sort_index)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             rusqlite::params![
                 r.hash,
                 r.link.kind.as_str(),
@@ -626,6 +658,8 @@ pub fn import_links(
                 // ever hold a value the enum can read back.
                 AssetState::Linked.as_str(),
                 r.link.media_url,
+                r.link.posted_at,
+                r.link.x_bookmark_sort_index,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -653,6 +687,8 @@ pub fn import_links(
             source_url: Some(r.link.page_url.clone()),
             remote_url: Some(r.link.media_url.clone()),
             note: None,
+            posted_at: r.link.posted_at.clone(),
+            x_bookmark_sort_index: r.link.x_bookmark_sort_index.clone(),
             imported_at,
             swatches: r.swatches.clone(),
             thumb_path: lib.thumb_path(&r.hash).display().to_string(),
@@ -979,12 +1015,14 @@ pub fn delete_assets(
             let mut rows = stmt.query([id])?;
             if let Some(r) = rows.next()? {
                 doomed.push((r.get(0)?, r.get(1)?, r.get(2)?));
-                // Only references with a remote identity get a tombstone. A
-                // dropped local import has nothing to be recognised by later,
-                // and re-adding a file you dragged in again is a deliberate act
-                // that should simply work.
-                if let Some(remote) = r.get::<_, Option<String>>(3)? {
-                    tombstones.push((remote, r.get(4)?, r.get(5)?));
+                // Current references use remote_url. Legacy X rows imported
+                // before that column was populated only have source_url, so
+                // retain the page URL as a fallback identity; otherwise the UI
+                // promises a dismissal that the database cannot record.
+                let page: Option<String> = r.get(4)?;
+                let remote = r.get::<_, Option<String>>(3)?.or_else(|| page.clone());
+                if let Some(remote) = remote {
+                    tombstones.push((remote, page, r.get(5)?));
                 }
             }
         }
@@ -1106,7 +1144,8 @@ pub fn list_assets(
 /// positionally. Kept in one place because the indices below depend on it.
 pub(crate) const ASSET_COLUMNS: &str =
     "SELECT id, hash, kind, duration_ms, ext, mime, width, height, bytes,
-            original_name, source_url, imported_at, state, remote_url, note
+            original_name, source_url, imported_at, state, remote_url, note,
+            posted_at, x_bookmark_sort_index
      FROM assets";
 
 pub(crate) fn row_to_asset(lib: &Library, r: &rusqlite::Row) -> rusqlite::Result<AssetRow> {
@@ -1130,6 +1169,8 @@ pub(crate) fn row_to_asset(lib: &Library, r: &rusqlite::Row) -> rusqlite::Result
         state: AssetState::from_str(&r.get::<_, String>(12)?),
         remote_url: r.get(13)?,
         note: r.get(14)?,
+        posted_at: r.get(15)?,
+        x_bookmark_sort_index: r.get(16)?,
         swatches: Vec::new(),
     })
 }
@@ -1370,6 +1411,8 @@ mod tests {
             media_url: media_url.into(),
             kind,
             title: Some("a reference".into()),
+            posted_at: None,
+            x_bookmark_sort_index: None,
             thumbnail: png_bytes(64, 36, rgba),
         }
     }
@@ -1461,6 +1504,37 @@ mod tests {
     }
 
     #[test]
+    fn x_post_date_and_saved_order_round_trip_and_refresh() {
+        let mut fx = Fixture::new("link-x-sort-metadata");
+        let url = "https://video.twimg.com/sorted.mp4";
+        let mut first = pending(url, MediaKind::Video, [1, 2, 3, 255]);
+        first.posted_at = Some("2024-05-03".into());
+        first.x_bookmark_sort_index = Some("10000000000000000001".into());
+
+        let report = import_links(&fx.lib, &mut fx.conn, vec![first]).expect("import");
+        assert_eq!(report.imported[0].posted_at.as_deref(), Some("2024-05-03"));
+        assert_eq!(
+            report.imported[0].x_bookmark_sort_index.as_deref(),
+            Some("10000000000000000001")
+        );
+
+        // X recalculates timeline positions as new bookmarks arrive. A repeat
+        // sync should enrich the existing row, not create another tile.
+        let mut repeat = pending(url, MediaKind::Video, [1, 2, 3, 255]);
+        repeat.posted_at = Some("2024-05-03".into());
+        repeat.x_bookmark_sort_index = Some("9999999999999999999".into());
+        let again = import_links(&fx.lib, &mut fx.conn, vec![repeat]).expect("repeat sync");
+        assert_eq!(again.duplicates, 1);
+
+        let stored = list_assets(&fx.lib, &fx.conn, 10, 0).expect("list");
+        assert_eq!(stored[0].posted_at.as_deref(), Some("2024-05-03"));
+        assert_eq!(
+            stored[0].x_bookmark_sort_index.as_deref(),
+            Some("9999999999999999999")
+        );
+    }
+
+    #[test]
     fn a_deleted_reference_does_not_come_back_on_the_next_sync() {
         // Otherwise "delete" means "delete until you sync again", which is not
         // what anybody means by delete.
@@ -1507,6 +1581,40 @@ mod tests {
         )
         .expect("import");
         assert_eq!(third.imported.len(), 1, "undismiss did not restore syncing");
+    }
+
+    #[test]
+    fn a_legacy_x_reference_without_remote_url_is_still_dismissed() {
+        // Before remote_url was populated for X downloads, existing rows kept
+        // only the post URL in source_url. Deleting one must still create a
+        // tombstone and keep that bookmark out of a later sync.
+        let mut fx = Fixture::new("dismiss-legacy-x");
+        let page = "https://x.com/someone/status/1";
+        let media = "https://video.twimg.com/legacy.mp4";
+        let first = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(media, MediaKind::Video, [9, 9, 9, 255])],
+        )
+        .expect("import");
+        let id = first.imported[0].id;
+        fx.conn
+            .execute("UPDATE assets SET remote_url = NULL WHERE id = ?1", [id])
+            .expect("make legacy row");
+
+        let deleted = delete_assets(&fx.lib, &mut fx.conn, &[id]).expect("delete");
+        assert_eq!(deleted.dismissed, 1, "legacy X row was not remembered");
+        let listed = list_dismissed(&fx.conn, 10).expect("list");
+        assert_eq!(listed[0].remote_url, page);
+
+        let second = import_links(
+            &fx.lib,
+            &mut fx.conn,
+            vec![pending(media, MediaKind::Video, [9, 9, 9, 255])],
+        )
+        .expect("sync");
+        assert!(second.imported.is_empty(), "legacy X row came back");
+        assert_eq!(second.dismissed, 1);
     }
 
     #[test]

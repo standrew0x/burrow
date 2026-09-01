@@ -46,6 +46,8 @@ fn main() {
                     media_url: r.media_url,
                     kind: r.kind,
                     title: r.title,
+                    posted_at: None,
+                    x_bookmark_sort_index: None,
                     thumbnail: r.thumbnail,
                 });
             }

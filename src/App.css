@@ -386,6 +386,51 @@ textarea {
   margin-left: auto;
 }
 
+.bar__sort {
+  display: flex;
+  gap: var(--s1);
+  align-items: center;
+  padding-right: var(--s2);
+  margin-right: var(--s1);
+  border-right: 1px solid var(--line);
+}
+
+.bar__sort label {
+  display: flex;
+  gap: var(--s1);
+  align-items: center;
+}
+
+.bar__sort label > span {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--ink-faint);
+  text-transform: uppercase;
+}
+
+.bar__sort select,
+.bar__sort button {
+  min-height: 34px;
+  padding: 6px 9px;
+  font-size: 12.5px;
+  color: var(--ink);
+  cursor: pointer;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r);
+}
+
+.bar__sort button:hover,
+.bar__sort select:hover {
+  border-color: var(--line-strong);
+}
+
+.bar__sort button {
+  color: var(--ink-dim);
+  white-space: nowrap;
+}
+
 .bar__xdot {
   flex: none;
   width: 7px;
@@ -957,7 +1002,16 @@ kbd {
   padding: var(--s3) var(--s3) var(--s2);
 }
 
+.tile__nameRow {
+  display: flex;
+  gap: var(--s2);
+  align-items: center;
+  min-width: 0;
+}
+
 .tile__name {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   font-family: var(--font-display);
   font-size: 15px;
@@ -966,9 +1020,28 @@ kbd {
   text-overflow: ellipsis;
 }
 
+.tile__source {
+  flex: none;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--accent);
+  cursor: pointer;
+  background: transparent;
+  border: 0;
+}
+
+.tile__source:hover {
+  color: var(--a-800);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
 /* Machine output goes to the mono face. If a person did not write it, it is
    not set in the serif — that rule is what makes notes read as handwriting. */
-.tile__dims {
+.tile__dims,
+.tile__date {
   font-family: var(--font-mono);
   font-size: 10.5px;
   letter-spacing: 0.02em;
@@ -1084,6 +1157,29 @@ kbd {
   font-size: 14px;
   line-height: 1.65;
   color: var(--ink-dim);
+}
+
+.empty__picker {
+  display: inline-flex;
+  margin: 1rem 0 0;
+  padding: 0.65rem 0.9rem;
+  border: 1px solid var(--line-strong);
+  background: var(--surface);
+  color: var(--ink);
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.empty__picker:hover {
+  border-color: var(--accent);
+}
+
+.empty__picker input {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .empty__path {
