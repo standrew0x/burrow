@@ -17,8 +17,8 @@ export type MediaKind = "image" | "video";
 /**
  * Whether the library holds this reference's bytes.
  *
- * `linked` means only a thumbnail was stored; the media plays by streaming from
- * `remoteUrl` and can be downloaded later.
+ * `linked` means only a thumbnail was stored. Burrow proxies X videos in small
+ * byte ranges so they can play and seek without first saving the whole file.
  */
 export type AssetState = "local" | "linked";
 
@@ -42,7 +42,7 @@ export interface Asset {
   remoteUrl: string | null;
   /** The user's own note. Null when unset — never an empty string. */
   note: string | null;
-  /** Source creation date (`YYYY-MM-DD`); for X this is the post date. */
+  /** Source creation time; for X this is a UTC ISO timestamp. */
   postedAt: string | null;
   /** Opaque X timeline position. Sortable as saved order, not an exact date. */
   xBookmarkSortIndex: string | null;
@@ -60,6 +60,22 @@ export interface DownloadReport {
   deduplicated: number;
   bytesWritten: number;
   failed: FailedImport[];
+}
+
+/** A still decoded from a video and saved back into the Burrow library. */
+export interface VideoSnapshot {
+  asset: Asset;
+  duplicate: boolean;
+  capturedAtMs: number;
+}
+
+/** One of X's actual MP4 encodes for a linked video. */
+export interface XVideoQuality {
+  label: string;
+  bitrate: number;
+  width: number | null;
+  height: number | null;
+  url: string;
 }
 
 /** `[assetId, done, total]` — payload of the `download-progress` event. */

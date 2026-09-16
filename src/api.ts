@@ -3,13 +3,14 @@ import { convertFileSrc, invoke } from "@tauri-apps/api/core";
 import type {
   Asset,
   Board,
-  ColorMatch,
   DeleteReport,
   Dismissed,
   DownloadReport,
   ImportReport,
   SyncOptions,
   SyncReport,
+  VideoSnapshot,
+  XVideoQuality,
   XStatus,
 } from "./types";
 
@@ -19,10 +20,13 @@ export const listAssets = (limit?: number, offset?: number) =>
 export const importPaths = (paths: string[]) =>
   invoke<ImportReport>("import_paths", { paths });
 
-export const searchByColor = (hex: string, tolerance?: number, limit?: number) =>
-  invoke<ColorMatch[]>("search_by_color", { hex, tolerance, limit });
+export const searchAssets = (query: string, tolerance?: number, limit?: number) =>
+  invoke<Asset[]>("search_assets", { query, tolerance, limit });
 
 export const libraryRoot = () => invoke<string>("library_root");
+
+/** Builds missing hard links, then returns the Explorer-friendly X video tree. */
+export const xDownloadsFolder = () => invoke<string>("x_downloads_folder");
 
 /**
  * Turns an absolute thumbnail path into a URL the webview can load.
@@ -40,18 +44,33 @@ export const blobUrl = (asset: Asset) => convertFileSrc(asset.blobPath);
 /**
  * Where to play this reference from.
  *
- * A linked reference streams from the host that holds it; a local one plays off
- * disk. The remote case is why `media-src` in tauri.conf.json carries `https:`
- * — a remote video cannot play without its origin being allowed, and the set of
- * origins is whatever the user pastes or bookmarks, so it cannot be listed
- * ahead of time.
+ * A generic linked reference streams from the host that holds it; a local one
+ * plays off disk. Linked X videos use Burrow's custom range proxy because
+ * WebView2 is not dependable with X's CDN directly. `https:` remains for the
+ * other pasted origins, which cannot be listed ahead of time.
  *
  * `img-src` is deliberately NOT widened to match. Thumbnails are fetched once
  * at import and cached locally, so browsing the grid contacts nobody; only
  * pressing play on a linked video reveals an IP address to its host.
  */
-export const playbackUrl = (asset: Asset) =>
-  asset.state === "linked" ? asset.remoteUrl : blobUrl(asset);
+const isXReference = (asset: Asset) => {
+  try {
+    const host = new URL(asset.sourceUrl ?? "").hostname.toLowerCase();
+    return ["x.com", "twitter.com", "mobile.x.com", "mobile.twitter.com"].includes(host);
+  } catch {
+    return false;
+  }
+};
+
+export const playbackUrl = (asset: Asset, qualityUrl?: string | null) => {
+  if (asset.state !== "linked") return blobUrl(asset);
+  // Tauri turns this into the correct custom-protocol URL for each platform.
+  if (isXReference(asset) && asset.kind === "video") {
+    const quality = qualityUrl ? `/${encodeURIComponent(qualityUrl)}` : "";
+    return convertFileSrc(`/video/${asset.id}${quality}`, "burrowstream");
+  }
+  return asset.remoteUrl;
+};
 
 /**
  * WebView2 plays mp4 and webm; everything else is stored and openable but will
@@ -93,10 +112,6 @@ export const moveToBoard = (fromBoard: number, toBoard: number, assetIds: number
 export const setNote = (assetId: number, note: string) =>
   invoke<string | null>("set_note", { assetId, note });
 
-/** References whose note contains `query`, case-insensitively. */
-export const searchNotes = (query: string, limit?: number) =>
-  invoke<Asset[]>("search_notes", { query, limit });
-
 /**
  * Permanent: removes the rows and unlinks the stored files.
  *
@@ -124,6 +139,31 @@ export const addLinks = (urls: string[]) =>
 /** Fetches the media behind linked references, making them local. */
 export const downloadAssets = (assetIds: number[]) =>
   invoke<DownloadReport>("download_assets", { assetIds });
+
+/** Saves the frame at the current playhead position as a new PNG reference. */
+export const captureVideoFrame = (
+  assetId: number,
+  positionMs: number,
+  boardId?: number | null,
+) => invoke<VideoSnapshot>("capture_video_frame", { assetId, positionMs, boardId });
+
+/** Imports a PNG frame decoded by the player, used for linked/streamed video. */
+export const captureRenderedVideoFrame = (
+  assetId: number,
+  positionMs: number,
+  pngBytes: number[],
+  boardId?: number | null,
+) =>
+  invoke<VideoSnapshot>("capture_rendered_video_frame", {
+    assetId,
+    positionMs,
+    pngBytes,
+    boardId,
+  });
+
+/** Real stream qualities exposed by X for a linked video, best first. */
+export const xVideoQualities = (assetId: number) =>
+  invoke<XVideoQuality[]>("x_video_qualities", { assetId });
 
 /** Pulls images and videos from X bookmarks. */
 export const syncFromX = (opts: SyncOptions) =>

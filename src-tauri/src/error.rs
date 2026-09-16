@@ -29,6 +29,9 @@ pub enum Error {
     Ffmpeg(String),
 
     #[error("{0}")]
+    Media(String),
+
+    #[error("{0}")]
     X(String),
 
     /// Anything wrong with a pasted URL: malformed, unreachable, refused as

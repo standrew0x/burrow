@@ -94,6 +94,25 @@ fn tool(name: &str) -> PathBuf {
     PathBuf::from(name)
 }
 
+/// Creates a media-tool process without flashing a console window on Windows.
+/// Burrow is a GUI app; the subprocess is an implementation detail and should
+/// never steal focus while somebody is browsing the library.
+fn media_command(name: &str) -> Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let mut command = Command::new(tool(name));
+        // CREATE_NO_WINDOW from WinBase.h. Keeping the value local avoids
+        // adding a Windows bindings crate for one stable process flag.
+        command.creation_flags(0x0800_0000);
+        command
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new(tool(name))
+    }
+}
+
 fn tool_missing(name: &str, e: &std::io::Error) -> Error {
     if e.kind() == std::io::ErrorKind::NotFound {
         Error::Ffmpeg(format!(
@@ -109,7 +128,7 @@ fn tool_missing(name: &str, e: &std::io::Error) -> Error {
 /// front instead of one failure per dropped file.
 pub fn tooling_available() -> bool {
     ["ffprobe", "ffmpeg"].iter().all(|name| {
-        Command::new(tool(name))
+        media_command(name)
             .arg("-version")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -167,7 +186,7 @@ pub fn probe(path: &Path) -> Result<Option<VideoInfo>> {
 
 /// Reads stream metadata from a file or a remote URL.
 pub fn probe_source(source: Source<'_>) -> Result<Option<VideoInfo>> {
-    let output = Command::new(tool("ffprobe"))
+    let output = media_command("ffprobe")
         .args([
             "-v",
             "error",
@@ -243,6 +262,44 @@ pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
     extract_poster_frame_from(Source::File(path), duration_ms)
 }
 
+/// Decodes the frame nearest a requested playback position as a full-resolution
+/// PNG. This is the video equivalent of VLC's snapshot command: no window,
+/// controls, cursor, or other screen content can enter the result because the
+/// pixels come directly from the media stream.
+pub fn extract_frame_at(path: &Path, position_ms: i64) -> Result<Vec<u8>> {
+    let offset = position_ms.max(0) as f64 / 1000.0;
+    let output = media_command("ffmpeg")
+        .args(["-v", "error"])
+        // Input seeking is fast enough for long reference clips and decoding
+        // one frame after the nearest keyframe keeps the UI wait short.
+        .args(["-ss", &format!("{offset:.3}")])
+        .arg("-i")
+        .arg(path)
+        .args([
+            "-frames:v",
+            "1",
+            "-an",
+            "-f",
+            "image2pipe",
+            "-vcodec",
+            "png",
+            "-",
+        ])
+        .output()
+        .map_err(|e| tool_missing("ffmpeg", &e))?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().last().unwrap_or("no output").trim();
+        return Err(Error::Ffmpeg(format!(
+            "could not capture the video frame at {offset:.3}s from {}: {detail}",
+            path.display()
+        )));
+    }
+
+    Ok(output.stdout)
+}
+
 /// Decodes one frame from a file or a remote URL.
 ///
 /// Against a URL this is a range request around the seek point rather than a
@@ -251,7 +308,7 @@ pub fn extract_poster_frame(path: &Path, duration_ms: i64) -> Result<Vec<u8>> {
 pub fn extract_poster_frame_from(source: Source<'_>, duration_ms: i64) -> Result<Vec<u8>> {
     let offset = poster_offset_seconds(duration_ms);
 
-    let output = Command::new(tool("ffmpeg"))
+    let output = media_command("ffmpeg")
         .args(["-v", "error"])
         .args(source.guard_args())
         // -ss BEFORE -i is the fast path: ffmpeg seeks the container instead of
@@ -378,6 +435,19 @@ mod tests {
             "frame should match the source dimensions"
         );
 
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn explicit_snapshot_is_a_full_size_png() {
+        let Some(path) = synth_video("snapshot", 3) else {
+            eprintln!("ffmpeg unavailable, skipping");
+            return;
+        };
+        let png = extract_frame_at(&path, 1_250).expect("capture");
+        assert_eq!(&png[..8], b"\x89PNG\r\n\x1a\n");
+        let decoded = image::load_from_memory(&png).expect("snapshot should decode");
+        assert_eq!((decoded.width(), decoded.height()), (320, 240));
         std::fs::remove_file(&path).ok();
     }
 

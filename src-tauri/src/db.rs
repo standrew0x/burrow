@@ -162,6 +162,79 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE assets ADD COLUMN x_bookmark_sort_index TEXT;
     CREATE INDEX assets_posted_at ON assets(posted_at DESC);
     "#,
+    // --- v8: reserved ---
+    //
+    // Version 8 was used by an unreleased cross-device prototype. Keep the
+    // migration slot so desktop libraries created during development remain
+    // compatible without publishing that unfinished sync schema.
+    r#"SELECT 1;"#,
+    // --- v9: precise, deterministic date-added ordering ---
+    //
+    // Imports used whole seconds, so every item in a batch tied and the UI
+    // fell back to an unrelated filename order. Microseconds remain exactly
+    // representable by JavaScript while leaving room to order a large batch.
+    r#"
+    UPDATE assets
+       SET imported_at = imported_at * 1000000
+     WHERE imported_at > 0 AND imported_at < 100000000000;
+    "#,
+    // --- v10: recover exact X post times for existing libraries ---
+    //
+    // X post ids are Snowflakes containing their creation millisecond. Older
+    // Burrow builds kept only YYYY-MM-DD, but the source URL still carries the
+    // id, so improve existing rows locally without another network request.
+    r#"
+    UPDATE assets
+       SET posted_at = strftime(
+             '%Y-%m-%dT%H:%M:%fZ',
+             (((CAST(substr(source_url, instr(source_url, '/status/') + 8) AS INTEGER) >> 22)
+                + 1288834974657) / 1000.0),
+             'unixepoch'
+           )
+     WHERE length(posted_at) = 10
+       AND instr(source_url, '/status/') > 0
+       AND substr(source_url, instr(source_url, '/status/') + 8) <> ''
+       AND substr(source_url, instr(source_url, '/status/') + 8) NOT GLOB '*[^0-9]*';
+    "#,
+    // --- v11: human-readable X download paths ---
+    //
+    // The content-addressed blob tree remains the canonical store because it
+    // deduplicates safely. This table tracks an Explorer-friendly hard link for
+    // each downloaded X video, so deleting a reference can unlink both names
+    // without leaving the large file behind.
+    r#"
+    CREATE TABLE x_download_paths (
+        asset_id      INTEGER PRIMARY KEY REFERENCES assets(id) ON DELETE CASCADE,
+        relative_path TEXT NOT NULL UNIQUE
+    );
+    "#,
+    // --- v12: recover missing X post dates too ---
+    //
+    // Some early downloaded rows never received even the calendar-only value
+    // repaired by v10. The post Snowflake still carries its millisecond time,
+    // which also lets the human-readable download tree group legacy videos.
+    r#"
+    UPDATE assets
+       SET posted_at = strftime(
+             '%Y-%m-%dT%H:%M:%fZ',
+             (((CAST(substr(source_url, instr(source_url, '/status/') + 8) AS INTEGER) >> 22)
+                + 1288834974657) / 1000.0),
+             'unixepoch'
+           )
+     WHERE (posted_at IS NULL OR posted_at = '')
+       AND instr(source_url, '/status/') > 0
+       AND substr(source_url, instr(source_url, '/status/') + 8) <> ''
+       AND substr(source_url, instr(source_url, '/status/') + 8) NOT GLOB '*[^0-9]*';
+    "#,
+    // --- v13: streamable X video qualities ---
+    //
+    // Bookmark responses already contain every MP4 encode. Keeping that small
+    // JSON array lets protected-account bookmarks change streaming quality too;
+    // the public post endpoint is only a fallback for libraries synced by an
+    // older Burrow build.
+    r#"
+    ALTER TABLE assets ADD COLUMN video_variants_json TEXT;
+    "#,
 ];
 
 /// Opens a connection, applies pragmas, and migrates to the current schema.
@@ -237,7 +310,13 @@ mod tests {
     #[test]
     fn expected_tables_exist() {
         let conn = open_in_memory().expect("open");
-        for table in ["assets", "tags", "asset_tags", "swatches"] {
+        for table in [
+            "assets",
+            "tags",
+            "asset_tags",
+            "swatches",
+            "x_download_paths",
+        ] {
             let n: i64 = conn
                 .query_row(
                     "SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?1",

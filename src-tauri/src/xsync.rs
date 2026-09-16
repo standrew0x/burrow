@@ -731,17 +731,17 @@ fn collect_page(
             if newest.as_deref().is_none_or(|n| first.date.as_str() > n) {
                 newest = Some(first.date.clone());
             }
+            // Date-range controls are calendar days and inclusive. Comparing
+            // their YYYY-MM-DD value to a full timestamp would incorrectly
+            // exclude every post after midnight on the selected end date.
+            let calendar_date = first.date.get(..10).unwrap_or(&first.date);
             // Skip, never stop. Bookmarks arrive in the order they were saved,
             // not the order they were written, so an out-of-window post says
             // nothing at all about the ones behind it.
-            if opts
-                .from
-                .as_deref()
-                .is_some_and(|f| first.date.as_str() < f)
-            {
+            if opts.from.as_deref().is_some_and(|f| calendar_date < f) {
                 continue;
             }
-            if opts.to.as_deref().is_some_and(|t| first.date.as_str() > t) {
+            if opts.to.as_deref().is_some_and(|t| calendar_date > t) {
                 continue;
             }
         }
@@ -780,6 +780,11 @@ fn collect_page(
 /// timeline API, and sending the session there would hand X's CDN -- and
 /// anything that could impersonate it -- a live login.
 pub fn public_post(status_id: &str) -> Result<Vec<BookmarkMedia>> {
+    let body = public_post_body(status_id)?;
+    Ok(media_from_tweet(&syndication_to_legacy(&body)))
+}
+
+fn public_post_body(status_id: &str) -> Result<Value> {
     if status_id.is_empty()
         || !status_id.bytes().all(|b| b.is_ascii_digit())
         || status_id.len() > 32
@@ -821,7 +826,50 @@ pub fn public_post(status_id: &str) -> Result<Vec<BookmarkMedia>> {
         .json()
         .map_err(|e| Error::X(format!("post {status_id}: {e}")))?;
 
-    Ok(media_from_tweet(&syndication_to_legacy(&body)))
+    Ok(body)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct XVideoQuality {
+    pub label: String,
+    pub bitrate: u64,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub url: String,
+}
+
+/// Returns the real MP4 encodes X exposes for one linked video.
+///
+/// Variants are discovered only when the viewer asks for them. This keeps a
+/// normal bookmark sync fast while allowing an existing linked reference to
+/// switch quality without downloading it or changing its durable remote URL.
+pub fn public_video_qualities(status_id: &str, current_url: &str) -> Result<Vec<XVideoQuality>> {
+    let body = public_post_body(status_id)?;
+    let legacy = syndication_to_legacy(&body);
+    let media = legacy
+        .pointer("/legacy/extended_entities/media")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let current = current_url.split('?').next().unwrap_or(current_url);
+    let mut groups: Vec<Vec<XVideoQuality>> = media
+        .iter()
+        .map(mp4_qualities)
+        .filter(|qualities| !qualities.is_empty())
+        .collect();
+    let selected = groups
+        .iter()
+        .position(|qualities| {
+            qualities
+                .iter()
+                .any(|quality| quality.url.split('?').next() == Some(current))
+        })
+        .or_else(|| (groups.len() == 1).then_some(0));
+    let Some(index) = selected else {
+        return Ok(Vec::new());
+    };
+    Ok(groups.swap_remove(index))
 }
 
 /// Reshapes an embed response into the timeline shape.
@@ -975,6 +1023,8 @@ pub struct BookmarkMedia {
     pub kind: BookmarkKind,
     /// Highest-quality URL: best mp4 variant, or the original-size photo.
     pub media_url: String,
+    /// All real MP4 encodes X exposed for this video, best first.
+    pub video_qualities: Vec<XVideoQuality>,
     /// Still image representing this item, when one is cheaper than the media.
     ///
     /// For video this is X's poster frame -- roughly 100KB against a 5MB mp4 --
@@ -985,7 +1035,7 @@ pub struct BookmarkMedia {
     pub poster_url: Option<String>,
     /// File extension to save under.
     pub ext: &'static str,
-    /// `YYYY-MM-DD` the post was created, for date filtering.
+    /// UTC ISO timestamp for when the post was created.
     pub date: String,
     /// Opaque position supplied by X's bookmark timeline. It orders saves, but
     /// is not documented as (and must not be displayed as) an exact timestamp.
@@ -1024,7 +1074,9 @@ impl BookmarkMedia {
 
         let mut parts: Vec<String> = Vec::with_capacity(5);
         if !self.date.is_empty() {
-            parts.push(self.date.clone());
+            // Only the calendar portion belongs in a filename. A full ISO
+            // timestamp contains colons, which are illegal in Windows names.
+            parts.push(self.date.get(..10).unwrap_or(&self.date).to_string());
         }
         // X handles are already [A-Za-z0-9_], but this string came off the wire.
         let author: String = self
@@ -1203,27 +1255,31 @@ impl FetchOptions {
     }
 }
 
-/// A post's creation date as `YYYY-MM-DD`.
+/// A post's creation time as a lexicographically sortable UTC ISO timestamp.
 ///
 /// Accepts both forms X emits: `Sun Aug 02 11:34:55 +0000 2026` from the
 /// timeline API and `2026-08-05T16:42:18.000Z` from the embed endpoint. One
 /// parser rather than two, so a pasted link and a synced bookmark date-filter
 /// identically.
 ///
-/// Compared as strings: X always reports UTC, so lexicographic ordering on
-/// `YYYY-MM-DD` is chronological and needs no date library.
+/// Keeping the time matters: reducing this to `YYYY-MM-DD` made every post on
+/// the same day tie, after which the UI appeared to sort them randomly.
 fn parse_created_at(created_at: &str) -> Option<String> {
-    // ISO 8601 already starts with the answer; validate rather than trust it.
-    if let Some(head) = created_at.get(..10) {
-        let b = head.as_bytes();
-        if b.len() == 10
-            && b[4] == b'-'
+    // Embed responses are already ISO 8601 UTC. Preserve their full precision
+    // after validating the portion sorting depends on.
+    if created_at.len() >= 20 {
+        let b = created_at.as_bytes();
+        if b[4] == b'-'
             && b[7] == b'-'
-            && b.iter()
+            && b[10] == b'T'
+            && b[13] == b':'
+            && b[16] == b':'
+            && b[..19]
+                .iter()
                 .enumerate()
-                .all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit())
+                .all(|(i, c)| matches!(i, 4 | 7 | 10 | 13 | 16) || c.is_ascii_digit())
         {
-            return Some(head.to_string());
+            return Some(created_at.to_string());
         }
     }
 
@@ -1237,7 +1293,20 @@ fn parse_created_at(created_at: &str) -> Option<String> {
     let month = MONTHS.iter().position(|m| *m == parts[1])? + 1;
     let day: u32 = parts[2].parse().ok()?;
     let year: i32 = parts[5].parse().ok()?;
-    Some(format!("{year:04}-{month:02}-{day:02}"))
+    let time = parts[3];
+    let tb = time.as_bytes();
+    if tb.len() != 8
+        || tb[2] != b':'
+        || tb[5] != b':'
+        || !tb
+            .iter()
+            .enumerate()
+            .all(|(i, c)| matches!(i, 2 | 5) || c.is_ascii_digit())
+        || parts[4] != "+0000"
+    {
+        return None;
+    }
+    Some(format!("{year:04}-{month:02}-{day:02}T{time}Z"))
 }
 
 fn extract_tweets_and_cursor(data: &Value) -> (Vec<Value>, Option<String>) {
@@ -1360,12 +1429,17 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
             .or_else(|| m.get("media_url"))
             .and_then(|u| u.as_str());
 
+        let video_qualities = mp4_qualities(m);
         let found = match kind_str {
             // animated_gif is served as a silent mp4, not a .gif.
-            "video" | "animated_gif" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
+            "video" | "animated_gif" => video_qualities
+                .first()
+                .map(|quality| (BookmarkKind::Video, quality.url.clone(), "mp4")),
             // Presence of video_info is the real signal; `type` is only a hint
             // and has been absent on nested/quoted results.
-            "" => best_mp4(m).map(|url| (BookmarkKind::Video, url, "mp4")),
+            "" => video_qualities
+                .first()
+                .map(|quality| (BookmarkKind::Video, quality.url.clone(), "mp4")),
             // Without ?name=orig X serves a downscaled render -- 1200px wide
             // instead of the 2048px original.
             "photo" => poster.map(|u| (BookmarkKind::Image, format!("{u}?name=orig"), "jpg")),
@@ -1380,6 +1454,7 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
                 text: text.clone(),
                 kind,
                 media_url,
+                video_qualities,
                 // A photo's media_url is already the image; a second smaller
                 // copy would be fetched for nothing.
                 poster_url: match kind {
@@ -1396,11 +1471,14 @@ fn media_from_tweet(result: &Value) -> Vec<BookmarkMedia> {
     out
 }
 
-fn best_mp4(media: &Value) -> Option<String> {
+fn mp4_qualities(media: &Value) -> Vec<XVideoQuality> {
     let variants = media
         .pointer("/video_info/variants")
-        .and_then(|v| v.as_array())?;
-    let mut best: Option<(u64, String)> = None;
+        .and_then(|v| v.as_array());
+    let Some(variants) = variants else {
+        return Vec::new();
+    };
+    let mut qualities = Vec::new();
     for v in variants {
         // Skip the HLS playlist: it is a manifest, not a file, and would need a
         // muxer to turn into something the library can store.
@@ -1411,16 +1489,57 @@ fn best_mp4(media: &Value) -> Option<String> {
         let Some(url) = v.get("url").and_then(|u| u.as_str()) else {
             continue;
         };
-        if best.as_ref().is_none_or(|(b, _)| bitrate > *b) {
-            best = Some((bitrate, url.to_string()));
-        }
+        let (width, height) = url
+            .split(['/', '?'])
+            .find_map(|part| {
+                let (width, height) = part.split_once('x')?;
+                Some((width.parse::<u32>().ok()?, height.parse::<u32>().ok()?))
+            })
+            .map(|(width, height)| (Some(width), Some(height)))
+            .unwrap_or((None, None));
+        let label = match height {
+            Some(height) => format!("{height}p"),
+            None if bitrate > 0 => format!("{:.1} Mbps", bitrate as f64 / 1_000_000.0),
+            None => "Standard".to_string(),
+        };
+        qualities.push(XVideoQuality {
+            label,
+            bitrate,
+            width,
+            height,
+            url: url.to_string(),
+        });
     }
-    best.map(|(_, url)| url)
+    qualities.sort_by(|left, right| {
+        right
+            .bitrate
+            .cmp(&left.bitrate)
+            .then_with(|| right.height.cmp(&left.height))
+    });
+    qualities.dedup_by(|left, right| left.url == right.url);
+    qualities
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn video_qualities_are_real_mp4_variants_best_first() {
+        let media = serde_json::json!({
+            "video_info": { "variants": [
+                { "content_type": "application/x-mpegURL", "url": "https://video.twimg.com/list.m3u8" },
+                { "content_type": "video/mp4", "bitrate": 256000, "url": "https://video.twimg.com/vid/320x180/clip.mp4" },
+                { "content_type": "video/mp4", "bitrate": 2176000, "url": "https://video.twimg.com/vid/1280x720/clip.mp4" }
+            ]}
+        });
+        let qualities = mp4_qualities(&media);
+        assert_eq!(qualities.len(), 2);
+        assert_eq!(qualities[0].label, "720p");
+        assert_eq!(qualities[0].width, Some(1280));
+        assert_eq!(qualities[1].label, "180p");
+        assert!(qualities[0].bitrate > qualities[1].bitrate);
+    }
 
     #[test]
     fn brace_blocks_reads_two_separate_literals() {
@@ -1440,6 +1559,7 @@ mod tests {
             text: String::new(),
             kind: BookmarkKind::Video,
             media_url: "https://video.twimg.com/x.mp4".into(),
+            video_qualities: Vec::new(),
             poster_url: None,
             ext: "mp4",
             date: "2026-01-01".into(),
@@ -1540,7 +1660,7 @@ mod tests {
         assert!(out.iter().all(|i| i.date.as_str() >= "2026-08-01"));
         // The stop heuristic reads the newest post on the page, including ones
         // the window rejected, so a jumbled page is judged by its best date.
-        assert_eq!(summary.newest.as_deref(), Some("2026-08-11"));
+        assert_eq!(summary.newest.as_deref(), Some("2026-08-11T00:00:00.000Z"));
     }
 
     #[test]
@@ -1561,7 +1681,7 @@ mod tests {
         let mut out = Vec::new();
         let summary = collect_page(&page, &opts, &mut out);
         assert!(out.is_empty());
-        assert_eq!(summary.newest.as_deref(), Some("2024-05-02"));
+        assert_eq!(summary.newest.as_deref(), Some("2024-05-02T00:00:00.000Z"));
     }
 
     #[test]
@@ -1579,7 +1699,7 @@ mod tests {
         let mut out = Vec::new();
         collect_page(&page, &opts, &mut out);
         assert_eq!(out.len(), 1, "only the 2025 post is inside the window");
-        assert_eq!(out[0].date, "2025-01-01");
+        assert_eq!(out[0].date, "2025-01-01T00:00:00.000Z");
     }
 
     #[test]
@@ -1663,7 +1783,7 @@ mod tests {
         // reshaping rather than writing a second extractor.
         assert_eq!(items[0].media_url, "https://x/4k.mp4");
         assert_eq!(items[0].author, "Lovable");
-        assert_eq!(items[0].date, "2026-08-05");
+        assert_eq!(items[0].date, "2026-08-05T16:42:18.000Z");
         assert_eq!(
             items[0].tweet_url,
             "https://x.com/Lovable/status/2085043732903301438"
@@ -1833,14 +1953,18 @@ mod tests {
     }
 
     #[test]
-    fn created_at_parses_to_a_sortable_date() {
+    fn created_at_preserves_a_sortable_time() {
         assert_eq!(
             parse_created_at("Sun Aug 02 11:34:55 +0000 2026").as_deref(),
-            Some("2026-08-02")
+            Some("2026-08-02T11:34:55Z")
         );
         assert_eq!(
             parse_created_at("Wed Jan 05 00:00:01 +0000 2022").as_deref(),
-            Some("2022-01-05")
+            Some("2022-01-05T00:00:01Z")
+        );
+        assert_eq!(
+            parse_created_at("2026-08-05T16:42:18.000Z").as_deref(),
+            Some("2026-08-05T16:42:18.000Z")
         );
         // Zero-padding is what makes string comparison chronological.
         assert!(
@@ -1873,7 +1997,7 @@ mod tests {
             "got {}",
             items[0].media_url
         );
-        assert_eq!(items[0].date, "2026-08-02");
+        assert_eq!(items[0].date, "2026-08-02T11:34:55Z");
     }
 
     #[test]

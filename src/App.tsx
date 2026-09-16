@@ -1,11 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
 import { openPath, openUrl } from "@tauri-apps/plugin-opener";
 
 import {
   addLinks,
   addToBoard,
   createBoard,
+  captureVideoFrame,
+  captureRenderedVideoFrame,
   deleteAssets,
   deleteBoard,
   downloadAssets,
@@ -19,25 +22,29 @@ import {
   moveToBoard,
   undismiss,
   playbackUrl,
+  blobUrl,
   removeFromBoard,
   renameBoard,
-  searchByColor,
-  searchNotes,
+  searchAssets,
   setNote,
   syncFromX,
   thumbUrl,
   clearXSession,
   saveXSession,
   xFolders,
+  xDownloadsFolder,
   xStatus,
+  xVideoQualities,
 } from "./api";
 import type {
   Asset,
   Board,
   Dismissed,
+  DownloadReport,
   FailedImport,
   SyncKinds,
   XStatus,
+  XVideoQuality,
 } from "./types";
 import "./App.css";
 
@@ -67,6 +74,8 @@ interface Notice {
   stoppedBecause?: string;
   moreAvailable?: boolean;
   scanned?: string;
+  /** Present when a video frame was saved into the library. */
+  captured?: string;
 }
 
 /** Anything that looks like a link the app could resolve. */
@@ -149,6 +158,36 @@ const DEMO_IMPORT_PATHS = (import.meta.env.VITE_BURROW_DEMO_IMPORT_PATHS ?? "")
  *  this number was picked; keep the two in step. */
 const COLOR_TOLERANCE = 0.05;
 
+function normalizedColorQuery(value: string | null): string | null {
+  if (!value) return null;
+  const digits = value.trim().replace(/^#/, "");
+  if (!/^(?:[0-9a-f]{3}|[0-9a-f]{6})$/i.test(digits)) return null;
+  return `#${digits.toLowerCase()}`;
+}
+
+async function renderedFramePng(video: HTMLVideoElement): Promise<number[]> {
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA || !video.videoWidth || !video.videoHeight) {
+    throw new Error("The video frame is not ready yet. Press play, then try again.");
+  }
+  const canvas = document.createElement("canvas");
+  canvas.width = video.videoWidth;
+  canvas.height = video.videoHeight;
+  const context = canvas.getContext("2d");
+  if (!context) throw new Error("Burrow could not create a snapshot canvas.");
+  context.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const blob = await new Promise<Blob>((resolve, reject) => {
+    try {
+      canvas.toBlob(
+        (value) => (value ? resolve(value) : reject(new Error("The video frame could not be encoded."))),
+        "image/png",
+      );
+    } catch {
+      reject(new Error("The video source did not allow its frame to be captured."));
+    }
+  });
+  return Array.from(new Uint8Array(await blob.arrayBuffer()));
+}
+
 function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
@@ -166,6 +205,8 @@ function formatDuration(ms: number): string {
 
 type SortKey = "added" | "name" | "posted" | "xSaved" | "kind" | "size" | "duration";
 type SortDirection = "asc" | "desc";
+type SourceFilter = "all" | "local" | "x" | "links";
+type Theme = "light" | "dark";
 
 const NAME_COLLATOR = new Intl.Collator(undefined, {
   numeric: true,
@@ -190,20 +231,49 @@ function directionLabel(key: SortKey, direction: SortDirection): string {
   if (key === "name" || key === "kind") return direction === "asc" ? "A–Z" : "Z–A";
   if (key === "size") return direction === "asc" ? "Smallest first" : "Largest first";
   if (key === "duration") return direction === "asc" ? "Shortest first" : "Longest first";
-  return direction === "asc" ? "Oldest first" : "Newest first";
+  if (key === "xSaved") return direction === "asc" ? "Earlier saves first" : "Recent saves first";
+  if (key === "posted") return direction === "asc" ? "Oldest posts first" : "Newest posts first";
+  return direction === "asc" ? "Oldest added first" : "Newest added first";
 }
 
 function formatSourceDate(value: string): string {
-  // Noon avoids a UTC date parsing edge shifting the label back a day in
-  // negative-offset timezones.
-  const date = new Date(`${value}T12:00:00`);
+  // Legacy rows contain YYYY-MM-DD; newer X syncs preserve the exact time.
+  // Noon keeps the legacy form from shifting back a day in western timezones.
+  const date = new Date(value.includes("T") ? value : `${value}T12:00:00`);
   return Number.isNaN(date.getTime())
     ? value
     : new Intl.DateTimeFormat(undefined, {
         month: "short",
         day: "numeric",
         year: "numeric",
+        ...(value.includes("T") ? { hour: "numeric", minute: "2-digit" } : {}),
       }).format(date);
+}
+
+function formatImportedDate(value: number): string {
+  // v9 stores microseconds. Accept older second/millisecond values as well so
+  // an open view stays readable while its database migration completes.
+  const milliseconds =
+    value >= 100_000_000_000_000
+      ? value / 1000
+      : value >= 100_000_000_000
+        ? value
+        : value * 1000;
+  const date = new Date(milliseconds);
+  return Number.isNaN(date.getTime())
+    ? "Unknown"
+    : new Intl.DateTimeFormat(undefined, {
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      }).format(date);
+}
+
+function sourceGroup(asset: Asset): Exclude<SourceFilter, "all"> {
+  if (!asset.sourceUrl && !asset.remoteUrl) return "local";
+  return sourceLabel(asset.sourceUrl) === "X" ? "x" : "links";
 }
 
 /** Readable ink over a swatch, chosen from OkLab lightness. */
@@ -217,11 +287,17 @@ export default function App() {
   const [importingCount, setImportingCount] = useState<number | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [colorFilter, setColorFilter] = useState<string | null>(null);
-  const [hexInput, setHexInput] = useState("");
   const [root, setRoot] = useState("");
-  const [playing, setPlaying] = useState<Asset | null>(null);
+  const [viewing, setViewing] = useState<Asset | null>(null);
+  const [viewerFullscreen, setViewerFullscreen] = useState(false);
+  const viewerFrame = useRef<HTMLDivElement | null>(null);
+  const viewerVideo = useRef<HTMLVideoElement | null>(null);
+  const [capturingFrame, setCapturingFrame] = useState(false);
   const [playbackFailed, setPlaybackFailed] = useState(false);
+  const [videoQualities, setVideoQualities] = useState<XVideoQuality[]>([]);
+  const [videoQualityUrl, setVideoQualityUrl] = useState<string | null>(null);
+  const [qualitiesLoading, setQualitiesLoading] = useState(false);
+  const [qualityError, setQualityError] = useState<string | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [syncBatch, setSyncBatch] = useState<number>(DEFAULT_SYNC_BATCH);
   const [syncOpen, setSyncOpen] = useState(false);
@@ -246,8 +322,8 @@ export default function App() {
   /** Reference whose note is open for editing, and the draft text. */
   const [editingNote, setEditingNote] = useState<number | null>(null);
   const [noteDraft, setNoteDraft] = useState("");
-  const [noteQuery, setNoteQuery] = useState("");
-  const [noteFilter, setNoteFilter] = useState<string | null>(null);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchFilter, setSearchFilter] = useState<string | null>(null);
   const [addingLinks, setAddingLinks] = useState(false);
   const [syncDownload, setSyncDownload] = useState(false);
   /** Viewing the tombstone list rather than any set of references. */
@@ -257,6 +333,12 @@ export default function App() {
   const [downloading, setDownloading] = useState<Set<number>>(new Set());
   const [sortKey, setSortKey] = useState<SortKey>("added");
   const [sortDirection, setSortDirection] = useState<SortDirection>("desc");
+  const [sourceFilter, setSourceFilter] = useState<SourceFilter>("all");
+  const [theme, setTheme] = useState<Theme>(() =>
+    window.localStorage.getItem("burrow-theme") === "dark" ? "dark" : "light",
+  );
+  const selectionAnchor = useRef<number | null>(null);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
   const activeBoard = useMemo(
     () => boards.find((b) => b.id === activeBoardId) ?? null,
@@ -284,19 +366,20 @@ export default function App() {
       }
     };
 
-    return [...assets].sort((left, right) => {
+    const visible =
+      sourceFilter === "all"
+        ? assets
+        : assets.filter((asset) => sourceGroup(asset) === sourceFilter);
+
+    return [...visible].sort((left, right) => {
       const a = value(left);
       const b = value(right);
       // Unknown source dates/order and image durations always go last. Flipping
       // direction should not make rows with no value look newest or largest.
       if (a === null && b !== null) return 1;
       if (a !== null && b === null) return -1;
-      if (a === null && b === null) {
-        return NAME_COLLATOR.compare(
-          left.originalName ?? left.hash,
-          right.originalName ?? right.hash,
-        );
-      }
+      if (a === null && b === null)
+        return sortDirection === "asc" ? left.id - right.id : right.id - left.id;
 
       let compared: number;
       if (sortKey === "xSaved") {
@@ -307,14 +390,62 @@ export default function App() {
         compared = NAME_COLLATOR.compare(String(a), String(b));
       }
       if (compared === 0) {
-        compared = NAME_COLLATOR.compare(
-          left.originalName ?? left.hash,
-          right.originalName ?? right.hash,
-        );
+        // IDs reflect insertion order and make same-batch timestamps stable.
+        // Filename was the old fallback, which made date sorts look random.
+        compared = left.id - right.id;
       }
       return sortDirection === "asc" ? compared : -compared;
     });
-  }, [assets, sortDirection, sortKey]);
+  }, [assets, sortDirection, sortKey, sourceFilter]);
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+    window.localStorage.setItem("burrow-theme", theme);
+  }, [theme]);
+
+  useEffect(() => {
+    const onFullscreenChange = () =>
+      setViewerFullscreen(document.fullscreenElement === viewerFrame.current);
+    document.addEventListener("fullscreenchange", onFullscreenChange);
+    return () => document.removeEventListener("fullscreenchange", onFullscreenChange);
+  }, []);
+
+  useEffect(() => {
+    setVideoQualities([]);
+    setVideoQualityUrl(null);
+    setQualityError(null);
+    if (
+      !viewing ||
+      viewing.kind !== "video" ||
+      viewing.state !== "linked" ||
+      sourceLabel(viewing.sourceUrl) !== "X"
+    ) {
+      setQualitiesLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    setQualitiesLoading(true);
+    xVideoQualities(viewing.id)
+      .then((qualities) => {
+        if (cancelled) return;
+        setVideoQualities(qualities);
+        const initial =
+          qualities.find((quality) => quality.url === viewing.remoteUrl) ?? qualities[0];
+        setVideoQualityUrl(initial?.url ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setQualityError("Quality options are unavailable for this post.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setQualitiesLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [viewing]);
 
   const refreshBoards = useCallback(async () => {
     try {
@@ -328,11 +459,8 @@ export default function App() {
     try {
       if (activeBoardId !== null) {
         setAssets(await listBoardAssets(activeBoardId, VIEW_LIMIT, 0));
-      } else if (noteFilter) {
-        setAssets(await searchNotes(noteFilter, VIEW_LIMIT));
-      } else if (colorFilter) {
-        const matches = await searchByColor(colorFilter, COLOR_TOLERANCE, VIEW_LIMIT);
-        setAssets(matches.map((m) => m.asset));
+      } else if (searchFilter) {
+        setAssets(await searchAssets(searchFilter, COLOR_TOLERANCE, VIEW_LIMIT));
       } else {
         setAssets(await listAssets(VIEW_LIMIT, 0));
       }
@@ -342,7 +470,7 @@ export default function App() {
     } finally {
       setLoading(false);
     }
-  }, [activeBoardId, colorFilter, noteFilter]);
+  }, [activeBoardId, searchFilter]);
 
   useEffect(() => {
     void refresh();
@@ -433,7 +561,8 @@ export default function App() {
         // A drop always lands in the library, so show it there rather than
         // leaving the user staring at an unchanged board.
         setActiveBoardId(null);
-        setColorFilter(null);
+        setSearchFilter(null);
+        setSearchQuery("");
         await refresh();
         await refreshBoards();
       } catch (e) {
@@ -488,7 +617,8 @@ export default function App() {
       try {
         const report = await addLinks(urls);
         setActiveBoardId(null);
-        setColorFilter(null);
+        setSearchFilter(null);
+        setSearchQuery("");
         setNotice({
           imported: report.imported.length,
           duplicates: report.duplicates,
@@ -539,8 +669,8 @@ export default function App() {
   }, [runAddLinks]);
 
   const runDownload = useCallback(
-    async (ids: number[]) => {
-      if (ids.length === 0) return;
+    async (ids: number[]): Promise<DownloadReport | null> => {
+      if (ids.length === 0) return null;
       setDownloading(new Set(ids));
       setError(null);
       setNotice(null);
@@ -556,13 +686,82 @@ export default function App() {
         });
         await refresh();
         await refreshBoards();
+        return report;
       } catch (e) {
         setError(String(e));
+        return null;
       } finally {
         setDownloading(new Set());
       }
     },
     [refresh, refreshBoards],
+  );
+
+  const pickMedia = useCallback(async () => {
+    if (DEMO_MODE) {
+      await runImport(DEMO_IMPORT_PATHS);
+      return;
+    }
+    try {
+      const selected = await openFileDialog({
+        multiple: true,
+        directory: false,
+        pickerMode: "media",
+        fileAccessMode: "copy",
+        filters: [
+          {
+            name: "Images and video",
+            extensions: [
+              "png",
+              "jpg",
+              "jpeg",
+              "webp",
+              "gif",
+              "avif",
+              "bmp",
+              "tif",
+              "tiff",
+              "mp4",
+              "m4v",
+              "mov",
+              "webm",
+              "mkv",
+            ],
+          },
+        ],
+      });
+      if (!selected) return;
+      const paths = Array.isArray(selected) ? selected : [selected];
+      await runImport(paths);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [runImport]);
+
+  const downloadAndPlay = useCallback(
+    async (asset: Asset) => {
+      setPlaybackFailed(false);
+      const report = await runDownload([asset.id]);
+      if (!report) {
+        setPlaybackFailed(true);
+        return;
+      }
+
+      const local = report.downloaded.find((item) => item.id === asset.id);
+      if (local) {
+        setViewing(local);
+        setPlaybackFailed(false);
+        return;
+      }
+
+      // A failure remains visible in the download notice; keep this dialog in
+      // its actionable state so the user can retry. If the bytes were already
+      // held under another row, the backend merged the duplicate and the grid
+      // now points at that local copy.
+      if (report.deduplicated > 0) setViewing(null);
+      else if (report.failed.length > 0) setPlaybackFailed(true);
+    },
+    [runDownload],
   );
 
   const openNote = (asset: Asset) => {
@@ -593,15 +792,142 @@ export default function App() {
     }
   };
 
-  const toggleSelected = (id: number) =>
+  const selectFromPointer = (event: React.MouseEvent, id: number) => {
+    event.stopPropagation();
+    const additive = event.ctrlKey || event.metaKey;
+    const anchor = selectionAnchor.current;
+
+    if (event.shiftKey && anchor !== null) {
+      const anchorIndex = sortedAssets.findIndex((asset) => asset.id === anchor);
+      const clickedIndex = sortedAssets.findIndex((asset) => asset.id === id);
+      if (anchorIndex !== -1 && clickedIndex !== -1) {
+        const start = Math.min(anchorIndex, clickedIndex);
+        const end = Math.max(anchorIndex, clickedIndex);
+        const range = sortedAssets.slice(start, end + 1).map((asset) => asset.id);
+        setSelected((previous) => {
+          const next = additive ? new Set(previous) : new Set<number>();
+          range.forEach((assetId) => next.add(assetId));
+          return next;
+        });
+        return;
+      }
+    }
+
     setSelected((prev) => {
       const next = new Set(prev);
       if (next.has(id)) next.delete(id);
       else next.add(id);
       return next;
     });
+    selectionAnchor.current = id;
+  };
 
-  const clearSelection = () => setSelected(new Set());
+  const openViewer = (event: React.MouseEvent, asset: Asset) => {
+    if (event.shiftKey || event.ctrlKey || event.metaKey) {
+      selectFromPointer(event, asset.id);
+      return;
+    }
+    setPlaybackFailed(false);
+    setViewing(asset);
+  };
+
+  const clearSelection = () => {
+    selectionAnchor.current = null;
+    setSelected(new Set());
+  };
+
+  const stepViewer = useCallback(
+    (direction: -1 | 1) => {
+      setViewing((current) => {
+        if (!current || sortedAssets.length < 2) return current;
+        const index = sortedAssets.findIndex((asset) => asset.id === current.id);
+        const next = (Math.max(index, 0) + direction + sortedAssets.length) % sortedAssets.length;
+        setPlaybackFailed(false);
+        return sortedAssets[next];
+      });
+    },
+    [sortedAssets],
+  );
+
+  const closeViewer = useCallback(async () => {
+    if (document.fullscreenElement === viewerFrame.current) {
+      await document.exitFullscreen().catch(() => {});
+    }
+    setViewing(null);
+    setPlaybackFailed(false);
+  }, []);
+
+  const toggleViewerFullscreen = async () => {
+    if (document.fullscreenElement === viewerFrame.current) {
+      await document.exitFullscreen();
+    } else {
+      await viewerFrame.current?.requestFullscreen();
+    }
+  };
+
+  const takeVideoSnapshot = useCallback(async () => {
+    if (!viewing || viewing.kind !== "video") return;
+    const video = viewerVideo.current;
+    if (!video || !Number.isFinite(video.currentTime)) {
+      setError("The video is not ready for a snapshot yet.");
+      return;
+    }
+
+    setCapturingFrame(true);
+    setError(null);
+    try {
+      const positionMs = Math.max(0, Math.round(video.currentTime * 1000));
+      const result =
+        viewing.state === "linked"
+          ? await captureRenderedVideoFrame(
+              viewing.id,
+              positionMs,
+              await renderedFramePng(video),
+              activeBoardId,
+            )
+          : await captureVideoFrame(viewing.id, positionMs, activeBoardId);
+      setNotice({
+        imported: result.duplicate ? 0 : 1,
+        duplicates: result.duplicate ? 1 : 0,
+        failed: [],
+        captured: result.asset.originalName ?? "Video snapshot",
+      });
+      await refresh();
+      await refreshBoards();
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setCapturingFrame(false);
+    }
+  }, [activeBoardId, refresh, refreshBoards, viewing]);
+
+  useEffect(() => {
+    if (!viewing) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "ArrowLeft") {
+        event.preventDefault();
+        stepViewer(-1);
+      } else if (event.key === "ArrowRight") {
+        event.preventDefault();
+        stepViewer(1);
+      } else if (event.key === "Escape" && !document.fullscreenElement) {
+        event.preventDefault();
+        void closeViewer();
+      } else if (
+        event.shiftKey &&
+        !event.ctrlKey &&
+        !event.metaKey &&
+        event.key.toLowerCase() === "s" &&
+        viewing.kind === "video" &&
+        !event.repeat
+      ) {
+        event.preventDefault();
+        void takeVideoSnapshot();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [closeViewer, stepViewer, takeVideoSnapshot, viewing]);
 
   /** Selected references that still live on someone else's server. */
   const selectedLinked = useMemo(
@@ -612,11 +938,10 @@ export default function App() {
 
   const showBoard = (id: number | null) => {
     setActiveBoardId(id);
-    setColorFilter(null);
-    setHexInput("");
-    setNoteFilter(null);
-    setNoteQuery("");
+    setSearchFilter(null);
+    setSearchQuery("");
     setShowDismissed(false);
+    setMobileNavOpen(false);
     clearSelection();
   };
 
@@ -630,6 +955,7 @@ export default function App() {
 
   const openDismissed = async () => {
     setShowDismissed(true);
+    setMobileNavOpen(false);
     clearSelection();
     await refreshDismissed();
   };
@@ -653,7 +979,8 @@ export default function App() {
         await new Promise((resolve) => window.setTimeout(resolve, 1200));
         const report = await importPaths(DEMO_X_PATHS);
         setActiveBoardId(null);
-        setColorFilter(null);
+        setSearchFilter(null);
+        setSearchQuery("");
         setNotice({
           imported: report.imported.length,
           duplicates: report.duplicates,
@@ -681,7 +1008,8 @@ export default function App() {
       // A sync always lands in the library, so show it there rather than
       // leaving the user on a board that did not change.
       setActiveBoardId(null);
-      setColorFilter(null);
+      setSearchFilter(null);
+      setSearchQuery("");
       setNotice({
         imported: report.imported,
         duplicates: report.duplicates,
@@ -704,17 +1032,6 @@ export default function App() {
     } finally {
       setSyncing(false);
     }
-  };
-
-  const submitHex = (e: React.FormEvent) => {
-    e.preventDefault();
-    const value = hexInput.trim();
-    if (!value) return;
-    // Colour search spans the whole library, so it leaves any active board.
-    setActiveBoardId(null);
-    setNoteFilter(null);
-    setColorFilter(value.startsWith("#") ? value : `#${value}`);
-    clearSelection();
   };
 
   const addSelectionTo = async (boardId: number) => {
@@ -811,6 +1128,46 @@ export default function App() {
     }
   };
 
+  const deleteViewedAsset = async () => {
+    if (!viewing) return;
+    const fromSource = Boolean(viewing.remoteUrl || viewing.sourceUrl);
+    const confirmed = window.confirm(
+      `Permanently delete this reference?\n\n` +
+        `Its stored file and thumbnail will be erased from your library, and it ` +
+        `will be removed from every board.\n\nYour original file on disk is not ` +
+        `touched. This cannot be undone.` +
+        (fromSource
+          ? `\n\nIt came from a link or from X, so it will also be kept out of ` +
+            `future syncs. You can undo that under Dismissed in the sidebar.`
+          : ""),
+    );
+    if (!confirmed) return;
+
+    try {
+      // Close first so WebView2 releases a local video file before Rust unlinks
+      // it on Windows. Linked videos stop their range requests here too.
+      await closeViewer();
+      const report = await deleteAssets([viewing.id]);
+      setNotice({
+        imported: 0,
+        duplicates: 0,
+        failed: report.orphanedFiles.map((path) => ({
+          path,
+          reason: "row deleted, but the file could not be unlinked",
+        })),
+        deleted: report.deleted,
+        dismissed: report.dismissed,
+        bytesFreed: report.bytesFreed,
+      });
+      await refresh();
+      await refreshBoards();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
+
+  const activeColorQuery = normalizedColorQuery(searchFilter);
+
   const heading = useMemo(() => {
     if (showDismissed) {
       return `${dismissed.length} kept out of sync`;
@@ -820,26 +1177,48 @@ export default function App() {
       return `Importing ${importingCount} file${importingCount === 1 ? "" : "s"}…`;
     }
     if (activeBoard) {
-      return `${assets.length} on ${activeBoard.name}`;
+      return `${sortedAssets.length} on ${activeBoard.name}`;
     }
-    if (noteFilter) return `${assets.length} noting “${noteFilter}”`;
-    if (colorFilter) return `${assets.length} matching ${colorFilter}`;
-    return `${assets.length} reference${assets.length === 1 ? "" : "s"}`;
+    if (searchFilter) {
+      return activeColorQuery
+        ? `${sortedAssets.length} matching ${activeColorQuery}`
+        : `${sortedAssets.length} matching “${searchFilter}”`;
+    }
+    return `${sortedAssets.length} reference${sortedAssets.length === 1 ? "" : "s"}`;
   }, [
     loading,
     importingCount,
     activeBoard,
-    colorFilter,
-    noteFilter,
-    assets.length,
+    activeColorQuery,
+    searchFilter,
+    sortedAssets.length,
     showDismissed,
     dismissed.length,
   ]);
 
   return (
     <div className={`app${dragging ? " app--dragging" : ""}`}>
-      <aside className="rail">
+      {mobileNavOpen && (
+        <button
+          type="button"
+          className="railScrim"
+          aria-label="Close navigation"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
+      <aside
+        className={`rail${mobileNavOpen ? " rail--open" : ""}`}
+        aria-label="Library navigation"
+      >
         <div className="rail__brand">Burrow</div>
+        <button
+          type="button"
+          className="rail__close"
+          aria-label="Close navigation"
+          onClick={() => setMobileNavOpen(false)}
+        >
+          ×
+        </button>
 
         <button
           type="button"
@@ -931,6 +1310,19 @@ export default function App() {
             folder to back up, and it is not somewhere anyone would guess. */}
         {root && (
           <div className="rail__foot">
+            <button
+              type="button"
+              className="rail__folderButton"
+              onClick={async () => {
+                try {
+                  await openPath(await xDownloadsFolder());
+                } catch (error) {
+                  window.alert(`Could not open the X video folder: ${String(error)}`);
+                }
+              }}
+            >
+              Open X video files
+            </button>
             <span className="rail__path" title={root}>
               {root}
             </span>
@@ -940,6 +1332,15 @@ export default function App() {
 
       <div className="main">
         <header className="bar">
+          <button
+            type="button"
+            className="mobileNavToggle"
+            aria-label="Open navigation"
+            aria-expanded={mobileNavOpen}
+            onClick={() => setMobileNavOpen(true)}
+          >
+            ☰
+          </button>
           <div className="bar__identity">
             <h1>
               {showDismissed ? "Dismissed" : activeBoard ? activeBoard.name : "Burrow"}
@@ -948,6 +1349,29 @@ export default function App() {
           </div>
 
           <div className="bar__actions">
+            {!showDismissed && (
+              <button type="button" className="bar__sync" onClick={() => void pickMedia()}>
+                Add files
+              </button>
+            )}
+            {!showDismissed && (
+              <label className="bar__sourceFilter">
+                <span>Show</span>
+                <select
+                  value={sourceFilter}
+                  onChange={(event) => {
+                    setSourceFilter(event.target.value as SourceFilter);
+                    clearSelection();
+                  }}
+                  aria-label="Filter references by source"
+                >
+                  <option value="all">All sources</option>
+                  <option value="local">My files</option>
+                  <option value="x">Synced from X</option>
+                  <option value="links">Other links</option>
+                </select>
+              </label>
+            )}
             {!showDismissed && (
               <div
                 className="bar__sort"
@@ -1041,6 +1465,15 @@ export default function App() {
                 ? `Syncing ${syncBatch}…`
                 : `Sync from X · ${syncDownload ? "full media" : "thumbnails"}`}
             </button>
+            <button
+              type="button"
+              className="bar__theme"
+              onClick={() => setTheme((current) => (current === "light" ? "dark" : "light"))}
+              aria-label={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+              title={`Switch to ${theme === "light" ? "dark" : "light"} mode`}
+            >
+              {theme === "light" ? "Dark" : "Light"}
+            </button>
           </div>
 
           <form
@@ -1067,56 +1500,31 @@ export default function App() {
             className="bar__search"
             onSubmit={(e) => {
               e.preventDefault();
-              const q = noteQuery.trim();
-              if (!q) return;
-              // Searching notes spans the library, so it leaves any board or
-              // colour filter rather than intersecting with them.
+              const query = searchQuery.trim();
+              if (!query) return;
+              // Search spans the whole library. A valid hex colour is routed
+              // through perceptual palette matching by the same backend query.
               setActiveBoardId(null);
-              setColorFilter(null);
-              setHexInput("");
-              setNoteFilter(q);
+              setSearchFilter(query);
               clearSelection();
             }}
           >
             <input
               type="search"
-              value={noteQuery}
-              onChange={(e) => setNoteQuery(e.target.value)}
-              placeholder="Search notes…"
-              aria-label="Search notes"
-            />
-            <button type="submit">Find</button>
-            {noteFilter && (
-              <button
-                type="button"
-                className="bar__clear"
-                onClick={() => {
-                  setNoteFilter(null);
-                  setNoteQuery("");
-                }}
-              >
-                Clear
-              </button>
-            )}
-          </form>
-
-          <form className="bar__search" onSubmit={submitHex}>
-            <input
-              type="text"
-              value={hexInput}
-              onChange={(e) => setHexInput(e.target.value)}
-              placeholder="#3d6fb1"
-              aria-label="Search by hex colour"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search names, notes, sources, or #colour…"
+              aria-label="Search references"
               spellCheck={false}
             />
-            <button type="submit">Search colour</button>
-            {colorFilter && (
+            <button type="submit" disabled={!searchQuery.trim()}>Find</button>
+            {searchFilter && (
               <button
                 type="button"
                 className="bar__clear"
                 onClick={() => {
-                  setColorFilter(null);
-                  setHexInput("");
+                  setSearchFilter(null);
+                  setSearchQuery("");
                 }}
               >
                 Clear
@@ -1345,11 +1753,11 @@ export default function App() {
           </div>
         )}
 
-        {colorFilter && (
+        {activeColorQuery && (
           <div className="filter">
-            <span className="filter__chip" style={{ background: colorFilter }} />
+            <span className="filter__chip" style={{ background: activeColorQuery }} />
             <span>
-              within {COLOR_TOLERANCE} OkLab of <code>{colorFilter}</code>
+              within {COLOR_TOLERANCE} OkLab of <code>{activeColorQuery}</code>
             </span>
           </div>
         )}
@@ -1362,7 +1770,12 @@ export default function App() {
 
         {notice && (
           <div className="banner">
-            {notice.deleted !== undefined ? (
+            {notice.captured ? (
+              <>
+                Snapshot saved: <strong>{notice.captured}</strong>
+                {notice.duplicates > 0 && <> · already in library</>}
+              </>
+            ) : notice.deleted !== undefined ? (
               <>
                 <strong>{notice.deleted}</strong> deleted
                 {notice.bytesFreed ? <> · {formatBytes(notice.bytesFreed)} freed</> : null}
@@ -1481,49 +1894,42 @@ export default function App() {
               </>
             )}
           </section>
-        ) : !loading && assets.length === 0 ? (
+        ) : !loading && sortedAssets.length === 0 ? (
           <div className="empty">
             <p className="empty__headline">
-              {activeBoard
+              {assets.length > 0 && sourceFilter !== "all"
+                ? "Nothing from this source is in this view."
+                : activeBoard
                 ? "This board is empty."
-                : noteFilter
-                  ? `No notes mention “${noteFilter}”.`
-                  : colorFilter
+                : searchFilter
+                  ? activeColorQuery
                     ? "Nothing matches that colour."
-                    : "Drop images or video here, or paste a link."}
+                    : `No references match “${searchFilter}”.`
+                  : "Drop images or video here, or paste a link."}
             </p>
             <p className="empty__detail">
-              {activeBoard
+              {assets.length > 0 && sourceFilter !== "all"
+                ? "Choose another source above, or add something new."
+                : activeBoard
                 ? "Go to All references, select some tiles, and add them here."
-                : noteFilter
-                  ? "Notes match on any part of a word, so try a shorter fragment."
-                  : colorFilter
+                : searchFilter
+                  ? activeColorQuery
                     ? "Try a different hue — the tolerance is deliberately tight."
-                    : "Drag files or folders from Explorer, or paste a YouTube, Spotify, Apple Music, or media link. Linked references store a thumbnail and open back to their source."}
+                    : "Search checks names, notes, sources, file types, and other reference details. Try a shorter fragment."
+                  : "Drag files or folders from Explorer, or paste a YouTube, Spotify, Apple Music, or media link. Linked references store a thumbnail and open back to their source."}
             </p>
-            {DEMO_MODE && !activeBoard && !noteFilter && !colorFilter && (
-              <label className="empty__picker">
-                Choose demo files…
-                <input
-                  type="file"
-                  multiple
-                  accept="image/*,video/*"
-                  onChange={(event) => {
-                    if (event.currentTarget.files?.length) {
-                      void runImport(DEMO_IMPORT_PATHS);
-                    }
-                    event.currentTarget.value = "";
-                  }}
-                />
-              </label>
+            {!activeBoard && !searchFilter && (
+              <button type="button" className="empty__picker" onClick={() => void pickMedia()}>
+                {DEMO_MODE ? "Choose demo files…" : "Choose images or video…"}
+              </button>
             )}
-            {root && !colorFilter && !activeBoard && (
+            {root && !searchFilter && !activeBoard && (
               <code className="empty__path">{root}</code>
             )}
           </div>
         ) : (
           <main className="grid">
-            {sortedAssets.map((asset) => {
+            {sortedAssets.map((asset, assetIndex) => {
               const isSelected = selected.has(asset.id);
               const sourceUrl = asset.sourceUrl;
               const source = sourceLabel(sourceUrl);
@@ -1534,19 +1940,38 @@ export default function App() {
                   key={asset.id}
                 >
                   <div className="tile__media">
-                    <img
-                      src={thumbUrl(asset)}
-                      alt={asset.originalName ?? asset.hash}
-                      loading="lazy"
-                      width={asset.width}
-                      height={asset.height}
-                    />
+                    {asset.kind === "image" ? (
+                      <button
+                        type="button"
+                        className="tile__preview"
+                        onClick={(event) => openViewer(event, asset)}
+                        aria-label={`View ${asset.originalName ?? "image"} larger`}
+                        title="Click to view · Ctrl-click to select · Shift-click for a range"
+                      >
+                        <img
+                          src={thumbUrl(asset)}
+                          alt={asset.originalName ?? asset.hash}
+                          loading="lazy"
+                          width={asset.width}
+                          height={asset.height}
+                        />
+                      </button>
+                    ) : (
+                      <img
+                        src={thumbUrl(asset)}
+                        alt={asset.originalName ?? asset.hash}
+                        loading="lazy"
+                        width={asset.width}
+                        height={asset.height}
+                      />
+                    )}
                     {asset.kind === "video" && (
                       <button
                         type="button"
                         className="tile__play"
-                        onClick={() => setPlaying(asset)}
+                        onClick={(event) => openViewer(event, asset)}
                         aria-label={`Play ${asset.originalName ?? "video"}`}
+                        title="Click to play · Ctrl-click to select · Shift-click for a range"
                       >
                         <span className="tile__playIcon" aria-hidden="true">
                           ▶
@@ -1571,7 +1996,9 @@ export default function App() {
                             ? "Downloading…"
                             : isMusic
                               ? "Save this reference's cover artwork to the library."
-                              : "Linked — streams from its source. Click to save a copy."
+                              : source === "X" && asset.kind === "video"
+                                ? "Thumbnail only — download the X video to play it."
+                                : "Linked — click to save a local copy."
                         }
                         aria-label={`${isMusic ? "Save artwork for" : "Download"} ${asset.originalName ?? "reference"}`}
                       >
@@ -1589,9 +2016,10 @@ export default function App() {
                     <button
                       type="button"
                       className={`tile__select${isSelected ? " tile__select--on" : ""}`}
-                      onClick={() => toggleSelected(asset.id)}
+                      onClick={(event) => selectFromPointer(event, asset.id)}
                       aria-pressed={isSelected}
                       aria-label={isSelected ? "Deselect" : "Select"}
+                      title="Select · Shift-click for a range"
                     >
                       {isSelected ? "✓" : ""}
                     </button>
@@ -1636,6 +2064,16 @@ export default function App() {
                     {asset.postedAt && (
                       <span className="tile__date">
                         Posted {formatSourceDate(asset.postedAt)}
+                      </span>
+                    )}
+                    {sortKey === "added" && (
+                      <span className="tile__sortValue">
+                        Added {formatImportedDate(asset.importedAt)}
+                      </span>
+                    )}
+                    {sortKey === "xSaved" && asset.xBookmarkSortIndex && (
+                      <span className="tile__sortValue">
+                        Saved on X · {assetIndex + 1} in this view
                       </span>
                     )}
                   </figcaption>
@@ -1691,8 +2129,8 @@ export default function App() {
                         title={`${s.hex} — ${Math.round(s.weight * 100)}% · click to find similar`}
                         onClick={() => {
                           setActiveBoardId(null);
-                          setColorFilter(s.hex);
-                          setHexInput(s.hex);
+                          setSearchFilter(s.hex);
+                          setSearchQuery(s.hex);
                           clearSelection();
                         }}
                       >
@@ -1799,65 +2237,188 @@ export default function App() {
         </div>
       )}
 
-      {playing && (
+      {viewing && (
         <div
           className="player"
           role="dialog"
           aria-modal="true"
-          aria-label={playing.originalName ?? "Video"}
-          onClick={() => {
-            setPlaying(null);
-            setPlaybackFailed(false);
-          }}
+          aria-label={viewing.originalName ?? "Reference viewer"}
+          onClick={() => void closeViewer()}
         >
-          <div className="player__frame" onClick={(e) => e.stopPropagation()}>
-            {isPlayableInline(playing) && !playbackFailed && playbackUrl(playing) ? (
+          <div
+            className="player__frame"
+            ref={viewerFrame}
+            onClick={(event) => event.stopPropagation()}
+          >
+            {sortedAssets.length > 1 && (
+              <button
+                type="button"
+                className="player__nav player__nav--previous"
+                onClick={() => stepViewer(-1)}
+                aria-label="Previous reference"
+                title="Previous (Left arrow)"
+              >
+                ‹
+              </button>
+            )}
+            {viewing.kind === "image" ? (
+              <div className="player__imageStage">
+                <img
+                  className="player__image"
+                  src={viewing.state === "local" ? blobUrl(viewing) : thumbUrl(viewing)}
+                  alt={viewing.originalName ?? "Reference"}
+                />
+              </div>
+            ) : isPlayableInline(viewing) &&
+            !playbackFailed &&
+            playbackUrl(viewing, videoQualityUrl) ? (
               <video
-                // A linked reference streams straight from its host; a local one
-                // plays off disk. The poster is the cached thumbnail either way,
-                // so there is something on screen before the first frame lands.
-                src={playbackUrl(playing) ?? undefined}
-                poster={thumbUrl(playing)}
+                // X links use Burrow's range-aware protocol; other links stream
+                // from their host and local videos play off disk.
+                crossOrigin={viewing.state === "linked" ? "anonymous" : undefined}
+                src={playbackUrl(viewing, videoQualityUrl) ?? undefined}
+                ref={viewerVideo}
+                poster={thumbUrl(viewing)}
                 controls
                 autoPlay
                 onError={() => setPlaybackFailed(true)}
               />
             ) : (
               <div className="player__fallback">
+                {viewing.state === "linked" && (
+                  <img
+                    className="player__poster"
+                    src={thumbUrl(viewing)}
+                    alt=""
+                    aria-hidden="true"
+                  />
+                )}
                 <p>
-                  {playing.state === "linked" && playbackFailed
-                    ? "That didn't stream — the link may have expired."
+                  {viewing.state === "linked" && playbackFailed
+                      ? "Burrow couldn't stream this video from its source. The link may have expired."
                     : `This one won't play in the app${
                         playbackFailed ? " — the codec isn't supported here." : "."
                       }`}
                 </p>
                 <p className="player__fallbackDetail">
-                  {playing.mime} · {playing.ext.toUpperCase()}
+                  {viewing.mime} · {viewing.ext.toUpperCase()}
                 </p>
-                {playing.state === "linked" ? (
+                {viewing.state === "linked" ? (
                   <button
                     type="button"
-                    disabled={downloading.has(playing.id)}
-                    onClick={() => void runDownload([playing.id])}
+                    disabled={downloading.has(viewing.id)}
+                    onClick={() => void downloadAndPlay(viewing)}
                   >
-                    {downloading.has(playing.id) ? "Downloading…" : "Download it"}
+                    {downloading.has(viewing.id) ? "Downloading…" : "Download & play"}
                   </button>
                 ) : (
-                  <button type="button" onClick={() => void openPath(playing.blobPath)}>
+                  <button type="button" onClick={() => void openPath(viewing.blobPath)}>
                     Open in default player
                   </button>
                 )}
               </div>
             )}
-            <div className="player__meta">
-              <span>{playing.originalName ?? playing.hash.slice(0, 12)}</span>
+            {sortedAssets.length > 1 && (
               <button
                 type="button"
-                onClick={() => {
-                  setPlaying(null);
-                  setPlaybackFailed(false);
-                }}
+                className="player__nav player__nav--next"
+                onClick={() => stepViewer(1)}
+                aria-label="Next reference"
+                title="Next (Right arrow)"
+              >
+                ›
+              </button>
+            )}
+            <div className="player__meta">
+              <span>{viewing.originalName ?? viewing.hash.slice(0, 12)}</span>
+              <small>
+                {Math.max(
+                  sortedAssets.findIndex((asset) => asset.id === viewing.id) + 1,
+                  1,
+                )}{" "}
+                / {sortedAssets.length}
+              </small>
+              {viewing.kind === "image" && viewing.state === "linked" && (
+                <button
+                  type="button"
+                  className="player__downloadOriginal"
+                  disabled={downloading.has(viewing.id)}
+                  onClick={() => void downloadAndPlay(viewing)}
+                  title="Save the original image locally and show it at full resolution"
+                >
+                  {downloading.has(viewing.id) ? "Downloading…" : "Get original"}
+                </button>
+              )}
+              {viewing.kind === "video" &&
+                viewing.state === "linked" &&
+                sourceLabel(viewing.sourceUrl) === "X" && (
+                  <select
+                    className="player__quality"
+                    value={videoQualityUrl ?? ""}
+                    disabled={qualitiesLoading || videoQualities.length === 0}
+                    onChange={(event) => {
+                      setPlaybackFailed(false);
+                      setVideoQualityUrl(event.target.value || null);
+                    }}
+                    aria-label="Streaming quality"
+                    title={
+                      qualityError ??
+                      (qualitiesLoading
+                        ? "Finding available X video qualities…"
+                        : "Change streaming quality")
+                    }
+                  >
+                    {qualitiesLoading ? (
+                      <option value="">Quality…</option>
+                    ) : videoQualities.length === 0 ? (
+                      <option value="">Auto quality</option>
+                    ) : (
+                      videoQualities.map((quality, index) => (
+                        <option value={quality.url} key={quality.url}>
+                          {quality.label}{index === 0 ? " · Best" : ""}
+                        </option>
+                      ))
+                    )}
+                  </select>
+                )}
+              {viewing.kind === "video" && (
+                <button
+                  type="button"
+                  className="player__snapshot"
+                  disabled={
+                    !isPlayableInline(viewing) ||
+                    playbackFailed ||
+                    capturingFrame
+                  }
+                  onClick={() => void takeVideoSnapshot()}
+                  aria-keyshortcuts="Shift+S"
+                  title="Save the current video frame (Shift + S)"
+                >
+                  {capturingFrame ? "Saving…" : "Snapshot · Shift+S"}
+                </button>
+              )}
+              <button
+                type="button"
+                className="player__fullscreen"
+                onClick={() => void toggleViewerFullscreen()}
+                aria-label={viewerFullscreen ? "Exit full screen" : "View full screen"}
+                title={viewerFullscreen ? "Exit full screen" : "View full screen"}
+              >
+                {viewerFullscreen ? "Exit full screen" : "Full screen"}
+              </button>
+              <button
+                type="button"
+                className="player__delete"
+                onClick={() => void deleteViewedAsset()}
+                title="Permanently delete this reference"
+              >
+                Delete
+              </button>
+              <button
+                type="button"
+                onClick={() => void closeViewer()}
                 aria-label="Close"
+                title="Close (Esc)"
               >
                 ×
               </button>

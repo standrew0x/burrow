@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
-use crate::ingest::{self, AssetRow, ColorMatch, ImportReport};
+use crate::ingest::{self, AssetRow, AssetState, ColorMatch, ImportReport, MediaKind};
 use crate::store::Library;
 
 /// Default OkLab radius for colour search.
@@ -27,6 +27,128 @@ pub struct AppState {
     /// splitting reads onto a pool is a later optimisation, not a correctness
     /// requirement.
     pub conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VideoSnapshot {
+    pub asset: AssetRow,
+    pub duplicate: bool,
+    pub captured_at_ms: i64,
+}
+
+fn safe_snapshot_stem(original_name: Option<&str>) -> String {
+    let stem = original_name
+        .and_then(|name| {
+            PathBuf::from(name)
+                .file_stem()
+                .map(|value| value.to_owned())
+        })
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video".to_string());
+    let cleaned: String = stem
+        .chars()
+        .map(|ch| match ch {
+            '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
+            ch if ch.is_control() => '_',
+            ch => ch,
+        })
+        .take(80)
+        .collect();
+    let cleaned = cleaned.trim().trim_end_matches('.');
+    if cleaned.is_empty() {
+        "video".to_string()
+    } else {
+        cleaned.to_string()
+    }
+}
+
+fn snapshot_name(original_name: Option<&str>, position_ms: i64) -> String {
+    let total_ms = position_ms.max(0);
+    let hours = total_ms / 3_600_000;
+    let minutes = (total_ms / 60_000) % 60;
+    let seconds = (total_ms / 1_000) % 60;
+    let millis = total_ms % 1_000;
+    format!(
+        "{} - {:02}-{:02}-{:02}.{:03}.png",
+        safe_snapshot_stem(original_name),
+        hours,
+        minutes,
+        seconds,
+        millis
+    )
+}
+
+fn snapshot_temp_path(name: &str) -> Result<PathBuf> {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let directory =
+        std::env::temp_dir().join(format!("burrow-snapshot-{}-{nonce}", std::process::id()));
+    std::fs::create_dir(&directory).map_err(|error| Error::io(&directory, error))?;
+    Ok(directory.join(name))
+}
+
+fn finish_video_snapshot(
+    library_root: PathBuf,
+    source_asset_id: i64,
+    board_id: Option<i64>,
+    position_ms: i64,
+    captured_path: PathBuf,
+) -> Result<VideoSnapshot> {
+    let cleanup_dir = captured_path.parent().map(PathBuf::from);
+    let result = (|| {
+        let library = Library::open(library_root)?;
+        let digest = crate::store::hash_file(&captured_path)?;
+        let mut conn = crate::db::open(&library.db_path())?;
+        let report =
+            ingest::import_paths(&library, &mut conn, std::slice::from_ref(&captured_path))?;
+        if let Some(failure) = report.failed.first() {
+            return Err(Error::Media(failure.reason.clone()));
+        }
+
+        let asset_id = if let Some(asset) = report.imported.first() {
+            asset.id
+        } else {
+            conn.query_row(
+                "SELECT id FROM assets WHERE hash = ?1 OR content_hash = ?1 LIMIT 1",
+                [&digest],
+                |row| row.get(0),
+            )?
+        };
+
+        let mut board_ids = {
+            let mut statement =
+                conn.prepare("SELECT board_id FROM board_items WHERE asset_id = ?1")?;
+            let ids = statement
+                .query_map([source_asset_id], |row| row.get::<_, i64>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            ids
+        };
+        if let Some(id) = board_id {
+            board_ids.push(id);
+        }
+        board_ids.sort_unstable();
+        board_ids.dedup();
+        for id in board_ids {
+            crate::boards::add_to_board(&mut conn, id, &[asset_id])?;
+        }
+
+        let asset = ingest::asset_by_id(&library, &conn, asset_id)?
+            .ok_or_else(|| Error::Media("the captured frame could not be found".to_string()))?;
+        Ok(VideoSnapshot {
+            asset,
+            duplicate: report.duplicates > 0,
+            captured_at_ms: position_ms,
+        })
+    })();
+
+    let _ = std::fs::remove_file(&captured_path);
+    if let Some(directory) = cleanup_dir {
+        let _ = std::fs::remove_dir(directory);
+    }
+    result
 }
 
 impl AppState {
@@ -79,8 +201,39 @@ pub fn search_by_color(
 }
 
 #[tauri::command]
+pub fn search_assets(
+    state: tauri::State<'_, AppState>,
+    query: String,
+    tolerance: Option<f32>,
+    limit: Option<usize>,
+) -> Result<Vec<AssetRow>> {
+    let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+    ingest::search_assets(
+        &state.library,
+        &conn,
+        &query,
+        tolerance.unwrap_or(DEFAULT_COLOR_TOLERANCE),
+        limit.unwrap_or(DEFAULT_PAGE_SIZE as usize),
+    )
+}
+
+#[tauri::command]
 pub fn library_root(state: tauri::State<'_, AppState>) -> String {
     state.library.root().display().to_string()
+}
+
+/// Explorer-friendly tree containing downloaded X videos.
+#[tauri::command]
+pub async fn x_downloads_folder(state: tauri::State<'_, AppState>) -> Result<String> {
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || -> Result<String> {
+        let library = Library::open(library_root)?;
+        let conn = crate::db::open(&library.db_path())?;
+        crate::x_library::organize_existing(&library, &conn)?;
+        Ok(crate::x_library::root(&library).display().to_string())
+    })
+    .await
+    .map_err(|error| Error::Media(format!("X video folder task stopped: {error}")))?
 }
 
 // --- boards ---
@@ -366,6 +519,9 @@ pub async fn sync_from_x(
                         title: Some(describe_post(item)),
                         posted_at: (!item.date.is_empty()).then(|| item.date.clone()),
                         x_bookmark_sort_index: item.bookmark_sort_index.clone(),
+                        video_variants_json: (!item.video_qualities.is_empty())
+                            .then(|| serde_json::to_string(&item.video_qualities).ok())
+                            .flatten(),
                         thumbnail,
                     }),
                     Err(e) => failed.push(crate::ingest::FailedImport {
@@ -493,6 +649,10 @@ pub async fn sync_from_x(
                         ])?;
                     }
                 }
+                // Metadata above is what gives the Explorer tree its date and
+                // account folders. Existing and newly downloaded X videos are
+                // linked into that tree without copying their bytes.
+                crate::x_library::organize_existing(&state.library, &conn)?;
             }
 
             // Staging is pure scratch once ingest has copied what it wants.
@@ -608,6 +768,7 @@ pub async fn add_links(
                     title: r.title,
                     posted_at: None,
                     x_bookmark_sort_index: None,
+                    video_variants_json: None,
                     thumbnail: r.thumbnail,
                 }),
                 Err(e) => failed.push(crate::ingest::FailedImport {
@@ -636,43 +797,217 @@ pub async fn add_links(
 /// Emits a `download-progress` event per item so a long run over a selection
 /// reports which one it is on rather than freezing the UI.
 ///
-/// Synchronous, and that is load-bearing. `reqwest::blocking::Client` owns an
-/// internal tokio runtime, and dropping a runtime inside an async context
-/// panics -- so an `async` version that built the X client in `spawn_blocking`
-/// and returned it here blew up on drop, at the end of the command, poisoning
-/// the database mutex and taking every later command down with it. The client
-/// must be created and dropped on the same non-async thread. Tauri runs sync
-/// commands off the UI thread, which is what `import_paths` already relies on
-/// for equally long work.
+/// The complete blocking lifetime—including the HTTP clients—is kept inside a
+/// dedicated worker. This avoids dropping reqwest's internal runtime from an
+/// async context while also keeping downloads, probing and thumbnail work off
+/// Tauri's IPC/UI path.
 #[tauri::command]
-pub fn download_assets(
+pub async fn download_assets(
     app: tauri::AppHandle,
     state: tauri::State<'_, AppState>,
     asset_ids: Vec<i64>,
 ) -> Result<crate::ingest::DownloadReport> {
-    use tauri::Emitter;
+    let library_root = state.library.root().to_path_buf();
+    tauri::async_runtime::spawn_blocking(move || {
+        use tauri::Emitter;
 
-    // One client for X media, one for everything else. Handing a non-X URL to
-    // the cookie-bearing client would send the session to a stranger's server.
-    let x = crate::xsync::XSession::load(&state.library)
-        .ok()
-        .and_then(|session| crate::xsync::XClient::new(session).ok());
+        let library = Library::open(library_root)?;
+        let mut conn = crate::db::open(&library.db_path())?;
+        // One client for X media, one for everything else. Handing a non-X URL
+        // to the cookie-bearing client would send the session to a stranger.
+        let x = crate::xsync::XSession::load(&library)
+            .ok()
+            .and_then(|session| crate::xsync::XClient::new(session).ok());
+        let progress_app = app.clone();
+        let report = ingest::download_assets(
+            &library,
+            &mut conn,
+            &asset_ids,
+            |url, dest| match (&x, crate::xsync::is_x_media(url)) {
+                (Some(client), true) => client.stream_to(url, dest),
+                _ => crate::link::download_to(url, dest),
+            },
+            |id, done, total| {
+                let _ = progress_app.emit("download-progress", (id, done, total));
+            },
+        )?;
+        for asset in &report.downloaded {
+            crate::x_library::organize_asset(&library, &conn, asset.id)?;
+        }
+        Ok(report)
+    })
+    .await
+    .map_err(|e| Error::Link(format!("download worker stopped unexpectedly: {e}")))?
+}
 
-    let mut conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
-    ingest::download_assets(
-        &state.library,
-        &mut conn,
-        &asset_ids,
-        |url, dest| match (&x, crate::xsync::is_x_media(url)) {
-            (Some(client), true) => client.stream_to(url, dest),
-            // No session, or not an X URL: the generic path, which validates
-            // the address and caps the transfer.
-            _ => crate::link::download_to(url, dest),
-        },
-        |id, done, total| {
-            let _ = app.emit("download-progress", (id, done, total));
-        },
-    )
+/// Captures the frame currently under the playhead and imports it as a PNG.
+///
+/// The frame is decoded from the video itself rather than from the screen, so
+/// player controls, the cursor, and other windows can never appear in it. The
+/// resulting image inherits every board the source video belongs to, plus the
+/// board currently being viewed when one was supplied.
+#[tauri::command]
+pub async fn capture_video_frame(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+    position_ms: i64,
+    board_id: Option<i64>,
+) -> Result<VideoSnapshot> {
+    let library_root = state.library.root().to_path_buf();
+    let source = {
+        let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+        ingest::asset_by_id(&state.library, &conn, asset_id)?
+            .ok_or_else(|| Error::Media("that video is no longer in the library".to_string()))?
+    };
+    if source.kind != MediaKind::Video {
+        return Err(Error::Media(
+            "only videos can produce a snapshot".to_string(),
+        ));
+    }
+    if source.state != AssetState::Local {
+        return Err(Error::Media(
+            "download this video before taking a snapshot".to_string(),
+        ));
+    }
+
+    // Seeking exactly to duration commonly lands after the final decodable
+    // frame. Keep the request inside the clip, but preserve zero for streams
+    // whose duration was unavailable.
+    let captured_at_ms = match source.duration_ms {
+        Some(duration) if duration > 0 => position_ms.clamp(0, duration.saturating_sub(1)),
+        _ => position_ms.max(0),
+    };
+    let capture_name = snapshot_name(source.original_name.as_deref(), captured_at_ms);
+    let video_path = PathBuf::from(&source.blob_path);
+
+    let capture_path = {
+        tauri::async_runtime::spawn_blocking(move || -> Result<PathBuf> {
+            let png = crate::video::extract_frame_at(&video_path, captured_at_ms)?;
+            let output_path = snapshot_temp_path(&capture_name)?;
+            if let Err(error) = std::fs::write(&output_path, png) {
+                if let Some(directory) = output_path.parent() {
+                    let _ = std::fs::remove_dir(directory);
+                }
+                return Err(Error::io(&output_path, error));
+            }
+            Ok(output_path)
+        })
+        .await
+        .map_err(|error| Error::Media(format!("snapshot worker stopped unexpectedly: {error}")))??
+    };
+
+    tauri::async_runtime::spawn_blocking(move || {
+        finish_video_snapshot(
+            library_root,
+            asset_id,
+            board_id,
+            captured_at_ms,
+            capture_path,
+        )
+    })
+    .await
+    .map_err(|error| Error::Media(format!("snapshot import stopped unexpectedly: {error}")))?
+}
+
+/// Imports a frame already decoded by the in-app video element.
+///
+/// This is the linked-video path: the webview has the current X frame in
+/// memory, so saving that one PNG avoids downloading a potentially huge video
+/// merely to ask FFmpeg for bytes the player has already decoded.
+#[tauri::command]
+pub async fn capture_rendered_video_frame(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+    position_ms: i64,
+    board_id: Option<i64>,
+    png_bytes: Vec<u8>,
+) -> Result<VideoSnapshot> {
+    const MAX_RENDERED_FRAME_BYTES: usize = 64 * 1024 * 1024;
+    if png_bytes.is_empty() || png_bytes.len() > MAX_RENDERED_FRAME_BYTES {
+        return Err(Error::Media(
+            "the decoded snapshot was empty or unexpectedly large".to_string(),
+        ));
+    }
+
+    let library_root = state.library.root().to_path_buf();
+    let source = {
+        let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+        ingest::asset_by_id(&state.library, &conn, asset_id)?
+            .ok_or_else(|| Error::Media("that video is no longer in the library".to_string()))?
+    };
+    if source.kind != MediaKind::Video {
+        return Err(Error::Media(
+            "only videos can produce a snapshot".to_string(),
+        ));
+    }
+    let captured_at_ms = position_ms.max(0);
+    let capture_name = snapshot_name(source.original_name.as_deref(), captured_at_ms);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        let capture_path = snapshot_temp_path(&capture_name)?;
+        if let Err(error) = std::fs::write(&capture_path, png_bytes) {
+            if let Some(directory) = capture_path.parent() {
+                let _ = std::fs::remove_dir(directory);
+            }
+            return Err(Error::io(&capture_path, error));
+        }
+        finish_video_snapshot(
+            library_root,
+            asset_id,
+            board_id,
+            captured_at_ms,
+            capture_path,
+        )
+    })
+    .await
+    .map_err(|error| Error::Media(format!("snapshot import stopped unexpectedly: {error}")))?
+}
+
+/// Available MP4 encodes for a linked X video, best quality first.
+#[tauri::command]
+pub async fn x_video_qualities(
+    state: tauri::State<'_, AppState>,
+    asset_id: i64,
+) -> Result<Vec<crate::xsync::XVideoQuality>> {
+    let (source_url, remote_url, stored_variants) = {
+        let conn = state.conn.lock().map_err(|_| Error::Poisoned)?;
+        conn.query_row(
+            "SELECT source_url, remote_url, video_variants_json FROM assets
+              WHERE id = ?1 AND state = 'linked' AND kind = 'video'",
+            [asset_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
+        )
+        .map_err(|_| Error::Media("that linked X video is no longer available".to_string()))?
+    };
+    if let Some(json) = stored_variants {
+        if let Ok(variants) = serde_json::from_str::<Vec<crate::xsync::XVideoQuality>>(&json) {
+            if !variants.is_empty() {
+                return Ok(variants);
+            }
+        }
+    }
+    let status_id = source_url
+        .split("/status/")
+        .nth(1)
+        .and_then(|tail| tail.split(['/', '?', '#']).next())
+        .filter(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+        .ok_or_else(|| Error::Media("this reference has no readable X post id".to_string()))?
+        .to_string();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::xsync::public_video_qualities(&status_id, &remote_url)
+    })
+    .await
+    .map_err(|error| {
+        Error::X(format!(
+            "video quality lookup stopped unexpectedly: {error}"
+        ))
+    })?
 }
 
 /// Bookmark folder names, so the UI can offer them instead of hardcoding one.
@@ -796,5 +1131,107 @@ fn check_session(lib: &crate::store::Library) -> XStatus {
             has_session: true,
             detail: e.to_string(),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_snapshot_is_imported_and_inherits_the_video_board() {
+        let root = std::env::temp_dir().join(format!(
+            "burrow-snapshot-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let library = Library::open(&root).unwrap();
+        let mut conn = crate::db::open(&library.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO assets
+                (hash, kind, duration_ms, ext, mime, width, height, bytes,
+                 original_name, imported_at, state, content_hash)
+             VALUES (?1, 'video', 5000, 'mp4', 'video/mp4', 320, 240, 10,
+                     'clip.mp4', 1, 'local', ?1)",
+            ["aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
+        )
+        .unwrap();
+        let source_id = conn.last_insert_rowid();
+        let board = crate::boards::create_board(&conn, "Frames").unwrap();
+        crate::boards::add_to_board(&mut conn, board.id, &[source_id]).unwrap();
+        drop(conn);
+
+        let capture_dir = root.join("temporary-capture");
+        std::fs::create_dir(&capture_dir).unwrap();
+        let capture_path = capture_dir.join(snapshot_name(Some("clip.mp4"), 1_234));
+        image::RgbaImage::from_pixel(24, 16, image::Rgba([12, 34, 56, 255]))
+            .save(&capture_path)
+            .unwrap();
+
+        let saved = finish_video_snapshot(root.clone(), source_id, None, 1_234, capture_path)
+            .expect("save snapshot");
+        assert!(!saved.duplicate);
+        assert_eq!(saved.asset.kind, MediaKind::Image);
+        assert_eq!(
+            saved.asset.original_name.as_deref(),
+            Some("clip - 00-00-01.234.png")
+        );
+
+        let conn = crate::db::open(&library.db_path()).unwrap();
+        let board_assets =
+            crate::boards::list_board_assets(&library, &conn, board.id, 10, 0).unwrap();
+        assert!(board_assets.iter().any(|asset| asset.id == saved.asset.id));
+        drop(conn);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn a_rendered_snapshot_does_not_require_downloaded_video_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "burrow-linked-snapshot-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let library = Library::open(&root).unwrap();
+        let conn = crate::db::open(&library.db_path()).unwrap();
+        conn.execute(
+            "INSERT INTO assets
+                (hash, kind, duration_ms, ext, mime, width, height, bytes,
+                 original_name, imported_at, state, remote_url, source_url)
+             VALUES (?1, 'video', 5000, 'mp4', 'video/mp4', 320, 240, 0,
+                     'x-stream.mp4', 1, 'linked', ?2, ?3)",
+            rusqlite::params![
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "https://video.twimg.com/example.mp4",
+                "https://x.com/example/status/123"
+            ],
+        )
+        .unwrap();
+        let source_id = conn.last_insert_rowid();
+        drop(conn);
+
+        let capture_dir = root.join("temporary-linked-capture");
+        std::fs::create_dir(&capture_dir).unwrap();
+        let capture_path = capture_dir.join(snapshot_name(Some("x-stream.mp4"), 2_000));
+        image::RgbaImage::from_pixel(24, 16, image::Rgba([90, 80, 70, 255]))
+            .save(&capture_path)
+            .unwrap();
+
+        let saved = finish_video_snapshot(root.clone(), source_id, None, 2_000, capture_path)
+            .expect("save rendered snapshot");
+        assert_eq!(saved.asset.kind, MediaKind::Image);
+        assert_eq!(saved.asset.state, AssetState::Local);
+        assert!(PathBuf::from(&saved.asset.blob_path).exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn snapshot_names_are_windows_safe() {
+        assert_eq!(
+            snapshot_name(Some("a<b>:c?.mp4"), 3_661_007),
+            "a_b__c_ - 01-01-01.007.png"
+        );
     }
 }

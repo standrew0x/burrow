@@ -246,6 +246,13 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+fn now_unix_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
+}
+
 fn file_name_of(path: &Path) -> Option<String> {
     path.file_name().map(|n| n.to_string_lossy().into_owned())
 }
@@ -327,9 +334,10 @@ pub fn import_paths(
     }
 
     // --- Phase 4: one transaction for all inserts ---
-    let imported_at = now_unix();
+    let imported_at = now_unix_micros();
     let tx = conn.transaction()?;
-    for p in &prepared {
+    for (index, p) in prepared.iter().enumerate() {
+        let imported_at = imported_at + index as i64;
         tx.execute(
             "INSERT INTO assets
                 (hash, kind, duration_ms, ext, mime, width, height, bytes,
@@ -444,6 +452,17 @@ fn prepare_video(
     hash: &str,
     info: video::VideoInfo,
 ) -> Result<Prepared> {
+    let frame_png = video::extract_poster_frame(path, info.duration_ms)?;
+    prepare_video_from_frame(lib, path, hash, &info, &frame_png)
+}
+
+fn prepare_video_from_frame(
+    lib: &Library,
+    path: &Path,
+    hash: &str,
+    info: &video::VideoInfo,
+    frame_png: &[u8],
+) -> Result<Prepared> {
     // Container comes from the extension because ffprobe reports the codec,
     // not the wrapper, and the wrapper is what decides playability.
     let ext = extension_of(path).unwrap_or_else(|| "mp4".to_string());
@@ -451,8 +470,7 @@ fn prepare_video(
 
     // The poster frame goes through the exact same thumbnail and OkLab palette
     // path as a still, so colour search works across video for free.
-    let frame_png = video::extract_poster_frame(path, info.duration_ms)?;
-    let frame = image_ops::decode(path, &frame_png)?;
+    let frame = image_ops::decode(path, frame_png)?;
 
     let thumb = image_ops::encode_webp(&image_ops::thumbnail(&frame, THUMB_LONG_EDGE))?;
     let swatches = palette_from_pixels(&image_ops::palette_samples(&frame), PALETTE_SIZE);
@@ -506,6 +524,8 @@ pub struct PendingLink {
     pub posted_at: Option<String>,
     /// Opaque X bookmark timeline position; higher values are newer saves.
     pub x_bookmark_sort_index: Option<String>,
+    /// X's real MP4 encodes, serialized for on-demand stream quality choices.
+    pub video_variants_json: Option<String>,
     /// Encoded still image, in whatever format the source served.
     pub thumbnail: Vec<u8>,
 }
@@ -595,15 +615,20 @@ pub fn import_links(
             if already {
                 // A later X sync can enrich a link created by an older build,
                 // and refresh the saved-order position as the timeline moves.
-                if link.posted_at.is_some() || link.x_bookmark_sort_index.is_some() {
+                if link.posted_at.is_some()
+                    || link.x_bookmark_sort_index.is_some()
+                    || link.video_variants_json.is_some()
+                {
                     conn.execute(
                         "UPDATE assets
                          SET posted_at = COALESCE(?1, posted_at),
-                             x_bookmark_sort_index = COALESCE(?2, x_bookmark_sort_index)
-                         WHERE remote_url = ?3",
+                             x_bookmark_sort_index = COALESCE(?2, x_bookmark_sort_index),
+                             video_variants_json = COALESCE(?3, video_variants_json)
+                         WHERE remote_url = ?4",
                         rusqlite::params![
                             &link.posted_at,
                             &link.x_bookmark_sort_index,
+                            &link.video_variants_json,
                             &link.media_url
                         ],
                     )?;
@@ -630,9 +655,10 @@ pub fn import_links(
         }
     }
 
-    let imported_at = now_unix();
+    let imported_at = now_unix_micros();
     let tx = conn.transaction()?;
-    for r in &ready {
+    for (index, r) in ready.iter().enumerate() {
+        let imported_at = imported_at + index as i64;
         let mime = match r.link.kind {
             MediaKind::Video => video_mime(&r.ext).to_string(),
             MediaKind::Image => image_ops::mime_for_extension(&r.ext).to_string(),
@@ -642,8 +668,8 @@ pub fn import_links(
             "INSERT INTO assets
                 (hash, kind, duration_ms, ext, mime, width, height, bytes,
                  original_name, source_url, imported_at, state, remote_url,
-                 posted_at, x_bookmark_sort_index)
-             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 posted_at, x_bookmark_sort_index, video_variants_json)
+             VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, 0, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             rusqlite::params![
                 r.hash,
                 r.link.kind.as_str(),
@@ -660,6 +686,7 @@ pub fn import_links(
                 r.link.media_url,
                 r.link.posted_at,
                 r.link.x_bookmark_sort_index,
+                r.link.video_variants_json,
             ],
         )?;
         let id = tx.last_insert_rowid();
@@ -945,8 +972,6 @@ fn describe_downloaded(path: &Path) -> Result<Downloaded> {
         let frame = image_ops::decode(path, &frame_png)?;
         let thumb = image_ops::encode_webp(&image_ops::thumbnail(&frame, THUMB_LONG_EDGE))?;
         return Ok(Downloaded {
-            // Dimensions come from the stream, not the decoded frame: ffmpeg
-            // may hand back square pixels where the stream is anamorphic.
             width: if info.width > 0 {
                 info.width
             } else {
@@ -1003,18 +1028,22 @@ pub fn delete_assets(
     }
 
     // Collect what to unlink before the rows disappear.
-    let mut doomed: Vec<(String, String, i64)> = Vec::with_capacity(asset_ids.len());
+    let mut doomed: Vec<(String, String, i64, Option<String>)> =
+        Vec::with_capacity(asset_ids.len());
     // And what to remember having thrown away.
     let mut tombstones: Vec<(String, Option<String>, Option<String>)> = Vec::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT hash, ext, bytes, remote_url, source_url, original_name
-               FROM assets WHERE id = ?1",
+            "SELECT a.hash, a.ext, a.bytes, a.remote_url, a.source_url,
+                    a.original_name, x.relative_path
+               FROM assets a
+               LEFT JOIN x_download_paths x ON x.asset_id = a.id
+              WHERE a.id = ?1",
         )?;
         for id in asset_ids {
             let mut rows = stmt.query([id])?;
             if let Some(r) = rows.next()? {
-                doomed.push((r.get(0)?, r.get(1)?, r.get(2)?));
+                doomed.push((r.get(0)?, r.get(1)?, r.get(2)?, r.get(6)?));
                 // Current references use remote_url. Legacy X rows imported
                 // before that column was populated only have source_url, so
                 // retain the page URL as a fallback identity; otherwise the UI
@@ -1049,11 +1078,18 @@ pub fn delete_assets(
     }
     tx.commit()?;
 
-    for (hash, ext, bytes) in doomed {
+    for (hash, ext, bytes, organised) in doomed {
         let blob = lib.blob_path(&hash, &ext);
         let thumb = lib.thumb_path(&hash);
         let mut clean = true;
-        for path in [&blob, &thumb] {
+        let organised = organised
+            .as_deref()
+            .and_then(|relative| crate::x_library::resolve_stored_path(lib, relative));
+        let mut paths = vec![blob, thumb];
+        if let Some(path) = organised {
+            paths.push(path);
+        }
+        for path in &paths {
             if path.exists() && std::fs::remove_file(path).is_err() {
                 report.orphaned_files.push(path.display().to_string());
                 clean = false;
@@ -1270,6 +1306,60 @@ pub fn search_by_color(
     Ok(out)
 }
 
+/// Searches the metadata a person can see or reasonably identify a reference
+/// by. A valid three- or six-digit hex value switches to perceptual palette
+/// matching, so the UI needs one search field rather than a separate colour
+/// tool that competes for space.
+pub fn search_assets(
+    lib: &Library,
+    conn: &Connection,
+    query: &str,
+    tolerance: f32,
+    limit: usize,
+) -> Result<Vec<AssetRow>> {
+    let query = query.trim();
+    if query.is_empty() {
+        return Ok(Vec::new());
+    }
+    if crate::color::parse_hex(query).is_some() {
+        return Ok(search_by_color(lib, conn, query, tolerance, limit)?
+            .into_iter()
+            .map(|matched| matched.asset)
+            .collect());
+    }
+
+    // `%` and `_` are wildcards in LIKE. Search input is literal text, so both
+    // must be escaped before it is reused across the metadata columns.
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let mut statement = conn.prepare(&format!(
+        "{ASSET_COLUMNS}
+          WHERE coalesce(original_name, '') LIKE ?1 ESCAPE '\\'
+             OR coalesce(note, '') LIKE ?1 ESCAPE '\\'
+             OR coalesce(source_url, '') LIKE ?1 ESCAPE '\\'
+             OR coalesce(remote_url, '') LIKE ?1 ESCAPE '\\'
+             OR coalesce(posted_at, '') LIKE ?1 ESCAPE '\\'
+             OR ext LIKE ?1 ESCAPE '\\'
+             OR mime LIKE ?1 ESCAPE '\\'
+             OR kind LIKE ?1 ESCAPE '\\'
+             OR state LIKE ?1 ESCAPE '\\'
+          ORDER BY imported_at DESC, id DESC LIMIT ?2"
+    ))?;
+    let rows = statement
+        .query_map(rusqlite::params![pattern, limit as i64], |row| {
+            row_to_asset(lib, row)
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut assets = rows;
+    for asset in &mut assets {
+        asset.swatches = swatches_for(conn, asset.id)?;
+    }
+    Ok(assets)
+}
+
 // --- notes ---
 
 /// Longest note kept. Generous for a caption and far short of a document; the
@@ -1413,6 +1503,7 @@ mod tests {
             title: Some("a reference".into()),
             posted_at: None,
             x_bookmark_sort_index: None,
+            video_variants_json: None,
             thumbnail: png_bytes(64, 36, rgba),
         }
     }
@@ -2477,6 +2568,43 @@ mod tests {
             green_hits[0].asset.original_name.as_deref(),
             Some("green.png")
         );
+    }
+
+    #[test]
+    fn unified_search_matches_names_notes_sources_types_and_colours() {
+        let mut fx = Fixture::new("unified-search");
+        let red = fx.write_png("Campaign-Hero.png", 16, 16, [255, 0, 0, 255]);
+        let green = fx.write_png("other.png", 16, 16, [0, 255, 0, 255]);
+        let report = import_paths(&fx.lib, &mut fx.conn, &[red, green]).expect("import");
+        let campaign_id = report
+            .imported
+            .iter()
+            .find(|asset| asset.original_name.as_deref() == Some("Campaign-Hero.png"))
+            .expect("campaign asset")
+            .id;
+        set_note(&fx.conn, campaign_id, "A quiet launch reference").expect("note");
+        fx.conn
+            .execute(
+                "UPDATE assets SET source_url = ?1 WHERE id = ?2",
+                rusqlite::params!["https://x.com/designer/status/123", campaign_id],
+            )
+            .expect("source");
+
+        for query in ["campaign-hero", "quiet launch", "designer"] {
+            let hits = search_assets(&fx.lib, &fx.conn, query, 0.05, 10).expect("search");
+            assert_eq!(hits.len(), 1, "query {query:?} returned {hits:?}");
+            assert_eq!(hits[0].id, campaign_id);
+        }
+
+        let type_hits =
+            search_assets(&fx.lib, &fx.conn, "image/png", 0.05, 10).expect("type search");
+        assert_eq!(type_hits.len(), 2);
+        assert!(type_hits.iter().any(|asset| asset.id == campaign_id));
+
+        let colour_hits =
+            search_assets(&fx.lib, &fx.conn, "#ff0000", 0.05, 10).expect("colour search");
+        assert_eq!(colour_hits.len(), 1, "{colour_hits:?}");
+        assert_eq!(colour_hits[0].id, campaign_id);
     }
 
     #[test]

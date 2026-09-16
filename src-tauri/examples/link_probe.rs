@@ -48,6 +48,7 @@ fn main() {
                     title: r.title,
                     posted_at: None,
                     x_bookmark_sort_index: None,
+                    video_variants_json: None,
                     thumbnail: r.thumbnail,
                 });
             }

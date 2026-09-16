@@ -70,7 +70,12 @@ impl Library {
     /// Opens (creating if absent) a library rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
-        for dir in [&root, &root.join("blobs"), &root.join("thumbs")] {
+        for dir in [
+            &root,
+            &root.join("blobs"),
+            &root.join("thumbs"),
+            &root.join("X Downloads").join("Videos"),
+        ] {
             std::fs::create_dir_all(dir).map_err(|e| Error::io(dir, e))?;
         }
         Ok(Self { root })

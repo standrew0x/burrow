@@ -2,13 +2,23 @@
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
   "description": "Capability for the main window",
-  "windows": ["main"],
+  "windows": [
+    "main"
+  ],
   "permissions": [
     "core:default",
     "opener:default",
     {
       "identifier": "opener:allow-open-path",
-      "allow": [{ "path": "$APPLOCALDATA/blobs/**" }]
-    }
+      "allow": [
+        {
+          "path": "$APPLOCALDATA/blobs/**"
+        },
+        {
+          "path": "$APPLOCALDATA/X Downloads/**"
+        }
+      ]
+    },
+    "dialog:default"
   ]
 }
